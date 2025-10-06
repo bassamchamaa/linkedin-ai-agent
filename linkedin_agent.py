@@ -17,7 +17,7 @@ class LinkedInAIAgent:
         self.gemini_api_version = None
         self.gemini_model = None
 
-        # Topics and queries (rotates across these)
+        # Topic rotation
         self.topics = {
             "tech_partnerships": [
                 "technology partnerships business development",
@@ -44,7 +44,7 @@ class LinkedInAIAgent:
             print("Gemini key missing. Set GEMINI_API_KEY.")
 
     # -----------------------------
-    # Utilities
+    # State helpers
     # -----------------------------
     def load_state(self):
         try:
@@ -90,9 +90,9 @@ class LinkedInAIAgent:
         return text.strip()
 
     # -----------------------------
-    # News fetching (Google News RSS)
+    # News fetch via Google News RSS
     # -----------------------------
-    def fetch_news(self, topic_key, query):
+    def fetch_news(self, topic_key, query, max_items=6):
         rss = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
         items = []
         try:
@@ -102,16 +102,12 @@ class LinkedInAIAgent:
                 return items
 
             content = r.text
-            titles_raw = re.findall(
-                r"<title>(?:<!\[CDATA\[(.*?)\]\]>|(.*?))</title>",
-                content,
-                flags=re.I | re.S,
-            )
+            titles_raw = re.findall(r"<title>(?:<!\[CDATA\[(.*?)\]\]>|(.*?))</title>", content, flags=re.I | re.S)
             titles = [(a or b) for a, b in titles_raw]
             links = re.findall(r"<link>(.*?)</link>", content, flags=re.I | re.S)
 
-            # Skip the feed title
-            paired = list(zip(titles[1:], links[1:]))[:6]
+            # Skip feed title
+            paired = list(zip(titles[1:], links[1:]))[:max_items]
             for title, link in paired:
                 if "news.google.com" in link and "url=" in link:
                     m = re.search(r"[?&]url=([^&]+)", link)
@@ -127,7 +123,7 @@ class LinkedInAIAgent:
         return items
 
     # -----------------------------
-    # Gemini endpoint resolution
+    # Gemini model resolution
     # -----------------------------
     def resolve_gemini_endpoint(self):
         if self.gemini_api_version and self.gemini_model:
@@ -175,98 +171,125 @@ class LinkedInAIAgent:
         print("Falling back to Gemini model: gemini-pro on v1")
 
     # -----------------------------
-    # Gemini generation
+    # Gemini generation with retries and prompt shrinking
     # -----------------------------
-    def generate_post_with_gemini(self, topic_key, news_items, include_link):
-        """Generate the post text using Google Gemini, robust to response shape changes."""
-        self.resolve_gemini_endpoint()
+    def _extract_text_from_gemini(self, payload):
+        try:
+            cand = payload["candidates"][0]
+        except Exception:
+            return None
 
-        news_context = "\n".join([f"- {i['title']}: {i['link']}" for i in news_items[:3]])
-        link_instruction = (
-            "You MUST include exactly one link to one of the news articles in the body of the post."
-            if include_link and any(x.get("link") for x in news_items)
-            else "Do NOT include any links. This should be a thought leadership piece based on current trends."
-        )
-
-        prompt = f"""You are a senior sales leader in tech and fintech with deep expertise in strategic partnerships. Create a LinkedIn post about {topic_key.replace('_', ' ')}.
-
-Recent news and trends:
-{news_context}
-
-Requirements:
-- 150 to 200 words
-- Write in the voice of a senior partnerships and revenue leader
-- Focus on partnerships, deal-making, or GTM strategy for tech and fintech
-- {link_instruction}
-- Add 2 or 3 relevant hashtags at the end
-- Make it actionable, with a clear point of view
-- Do not use em dashes. Use commas, periods, or colons instead.
-- Return only the post text, ready to publish.
-"""
-
-        base = f"https://generativelanguage.googleapis.com/{self.gemini_api_version}/models/{self.gemini_model}:generateContent"
-        headers = {"Content-Type": "application/json"}
-        body = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 350},
-        }
-
-        def _extract_text(payload):
-            try:
-                cand = payload["candidates"][0]
-            except Exception:
-                return None
-
-            content = cand.get("content")
-            if isinstance(content, dict):
-                parts = content.get("parts")
-                if isinstance(parts, list):
-                    texts = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
-                    if any(texts):
-                        return "\n".join(t for t in texts if t)
-            if isinstance(content, list):
-                texts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
+        content = cand.get("content")
+        if isinstance(content, dict):
+            parts = content.get("parts")
+            if isinstance(parts, list):
+                texts = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
                 if any(texts):
                     return "\n".join(t for t in texts if t)
-            msg = cand.get("message", {})
-            if isinstance(msg, dict):
-                mcontent = msg.get("content")
-                if isinstance(mcontent, list):
-                    texts = [p.get("text", "") for p in mcontent if isinstance(p, dict) and "text" in p]
-                    if any(texts):
-                        return "\n".join(t for t in texts if t)
-            if "text" in cand:
-                return cand["text"]
-            return None
+        if isinstance(content, list):
+            texts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
+            if any(texts):
+                return "\n".join(t for t in texts if t)
+        msg = cand.get("message", {})
+        if isinstance(msg, dict):
+            mcontent = msg.get("content")
+            if isinstance(mcontent, list):
+                texts = [p.get("text", "") for p in mcontent if isinstance(p, dict) and "text" in p]
+                if any(texts):
+                    return "\n".join(t for t in texts if t)
+        if "text" in cand:
+            return cand["text"]
+        return None
 
-        try:
-            resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
-            if resp.status_code != 200:
-                print(f"Gemini error {resp.status_code}: {resp.text[:600]}")
-                return None
+    def _build_prompt(self, topic_key, news_items, include_link, keep=2):
+        # Keep the prompt lean to avoid MAX_TOKENS
+        trimmed = []
+        for it in news_items[:keep]:
+            title = it["title"]
+            if len(title) > 110:
+                title = title[:107] + "..."
+            trimmed.append(f"- {title}{f' | {it['link']}' if it.get('link') else ''}")
 
-            data = resp.json()
-            post = _extract_text(data)
-            if not post:
-                print("Gemini response preview:", json.dumps(data)[:600])
-                return None
+        news_context = "\n".join(trimmed)
+        link_instruction = (
+            "Include exactly one news link in the body."
+            if include_link and any(x.get("link") for x in news_items)
+            else "Do not include any links."
+        )
 
-            post = self.enforce_style_rules(post)
+        prompt = (
+            f"Write a LinkedIn post from a senior tech and fintech partnerships leader about "
+            f"{topic_key.replace('_', ' ')}.\n\n"
+            f"Use 150 to 190 words. Make it concrete, strategic, and useful for BD and GTM leaders. "
+            f"No em dashes. Add two or three relevant hashtags at the end. "
+            f"{link_instruction}\n\n"
+            f"Recent items:\n{news_context}\n\n"
+            f"Return only the post text."
+        )
+        return prompt
 
-            if include_link:
-                has_link = "http://" in post or "https://" in post
-                if not has_link:
-                    for it in news_items:
-                        if it.get("link"):
-                            post += f"\n\n{it['link']}"
-                            break
-                    post = self.enforce_style_rules(post)
+    def generate_post_with_gemini(self, topic_key, news_items, include_link):
+        self.resolve_gemini_endpoint()
 
-            return post
+        base = (
+            f"https://generativelanguage.googleapis.com/"
+            f"{self.gemini_api_version}/models/{self.gemini_model}:generateContent"
+        )
+        headers = {"Content-Type": "application/json"}
 
-        except Exception as e:
-            print(f"Error generating post: {e}")
-            return None
+        # Retry strategy: shrink context, then fallback model
+        attempts = [
+            {"keep": 2, "max_tokens": 300, "model": None},
+            {"keep": 1, "max_tokens": 260, "model": None},
+            {"keep": 0, "max_tokens": 240, "model": "gemini-pro"},
+        ]
+
+        for i, step in enumerate(attempts, start=1):
+            if step["model"]:
+                self.gemini_model = step["model"]
+                self.gemini_api_version = "v1"
+                base = (
+                    f"https://generativelanguage.googleapis.com/"
+                    f"{self.gemini_api_version}/models/{self.gemini_model}:generateContent"
+                )
+
+            prompt = self._build_prompt(topic_key, news_items, include_link, keep=step["keep"])
+            body = {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.7, "maxOutputTokens": step["max_tokens"]},
+            }
+
+            try:
+                resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
+                if resp.status_code != 200:
+                    print(f"Gemini error {resp.status_code} on attempt {i}: {resp.text[:600]}")
+                    continue
+
+                data = resp.json()
+                text = self._extract_text_from_gemini(data)
+                if not text:
+                    # Show brief preview for debugging and retry smaller
+                    print("Gemini response preview:", json.dumps(data)[:600])
+                    continue
+
+                text = self.enforce_style_rules(text)
+
+                if include_link:
+                    has_link = "http://" in text or "https://" in text
+                    if not has_link:
+                        for it in news_items:
+                            if it.get("link"):
+                                text += f"\n\n{it['link']}"
+                                break
+                        text = self.enforce_style_rules(text)
+
+                return text
+
+            except Exception as e:
+                print(f"Error generating post on attempt {i}: {e}")
+                continue
+
+        return None
 
     # -----------------------------
     # LinkedIn posting
@@ -301,16 +324,16 @@ Requirements:
                 return True
             print(f"✗ Failed to post: {r.status_code} - {r.text[:400]}")
             if r.status_code == 401:
-                print("Hint: 401 usually means the access token is expired or missing w_member_social scope.")
+                print("Hint: token expired or missing w_member_social scope.")
             if r.status_code == 403:
-                print("Hint: 403 can mean the app is not approved for member posts or the token lacks permissions.")
+                print("Hint: app lacks permission to post as a member.")
             return False
         except Exception as e:
             print(f"✗ Error posting to LinkedIn: {e}")
             return False
 
     # -----------------------------
-    # Main run (one post per run)
+    # Main run
     # -----------------------------
     def run_weekly_post(self):
         print("\n" + "=" * 60)
@@ -338,7 +361,7 @@ Requirements:
         print("Generating post with Gemini...")
         post_text = self.generate_post_with_gemini(topic_key, news_items, include_link)
         if not post_text:
-            print("⚠ Post generation returned None. See any Gemini error above.")
+            print("⚠ Post generation returned None after retries.")
             return
 
         print("\nGenerated post:\n" + "-" * 60)
