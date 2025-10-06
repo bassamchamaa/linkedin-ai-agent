@@ -163,6 +163,7 @@ class LinkedInAIAgent:
             else "Do not include any links."
         )
 
+        # System style baked into prompt for v1
         prompt = (
             f"Write a LinkedIn post from a senior tech and fintech partnerships leader about "
             f"{topic_key.replace('_', ' ')}.\n\n"
@@ -187,17 +188,17 @@ class LinkedInAIAgent:
 
     def generate_post_with_gemini(self, topic_key, news_items, include_link):
         """
-        Retry strategy:
-          1) v1 gemini-2.5-flash, larger output budget
-          2) v1 gemini-2.5-flash with tighter prompt
-          3) v1beta gemini-1.5-flash-latest
-          4) v1beta gemini-1.5-flash with very tight prompt
+        Retry strategy with reasoning cap:
+          1) v1 gemini-2.5-flash, thinking 128 tokens
+          2) v1 gemini-2.5-flash, thinking 64 tokens, tighter prompt
+          3) v1beta gemini-1.5-flash-latest, thinking 64 tokens
+          4) v1beta gemini-1.5-flash, thinking 32 tokens, very tight prompt
         """
         attempts = [
-            {"api": "v1", "model": "gemini-2.5-flash", "keep": 2, "max_out": 900, "words": (130, 170)},
-            {"api": "v1", "model": "gemini-2.5-flash", "keep": 1, "max_out": 700, "words": (120, 160)},
-            {"api": "v1beta", "model": "gemini-1.5-flash-latest", "keep": 2, "max_out": 800, "words": (130, 170)},
-            {"api": "v1beta", "model": "gemini-1.5-flash", "keep": 1, "max_out": 650, "words": (110, 150)},
+            {"api": "v1", "model": "gemini-2.5-flash", "keep": 2, "max_out": 900, "think": 128, "words": (130, 170)},
+            {"api": "v1", "model": "gemini-2.5-flash", "keep": 1, "max_out": 700, "think": 64, "words": (120, 160)},
+            {"api": "v1beta", "model": "gemini-1.5-flash-latest", "keep": 2, "max_out": 800, "think": 64, "words": (130, 170)},
+            {"api": "v1beta", "model": "gemini-1.5-flash", "keep": 1, "max_out": 600, "think": 32, "words": (110, 150)},
         ]
 
         # Filter attempts by actual availability
@@ -227,16 +228,36 @@ class LinkedInAIAgent:
                 words_low=step["words"][0],
                 words_high=step["words"][1],
             )
+
+            # Use systemInstruction when supported, but keep prompt minimal
+            system_instruction = {
+                "role": "system",
+                "parts": [
+                    {
+                        "text": (
+                            "You write LinkedIn posts for a senior tech and fintech partnerships leader. "
+                            "Keep it concise, human, and useful. No em dashes. Return text only."
+                        )
+                    }
+                ],
+            }
+
             body = {
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "temperature": 0.7,
                     "maxOutputTokens": step["max_out"],
-                    # keep minimal to avoid 400s on unsupported fields
+                    "responseMimeType": "text/plain",
                 },
+                "systemInstruction": system_instruction,
+                # Cap the internal reasoning budget so the model does not burn all tokens thinking
+                "thinking": {"budgetTokens": step["think"]},
             }
 
-            print(f"Attempt {i}: {step['model']} on {step['api']} with maxOutputTokens={step['max_out']}")
+            print(
+                f"Attempt {i}: {step['model']} on {step['api']} "
+                f"with maxOutputTokens={step['max_out']} and thinking={step['think']}"
+            )
             try:
                 resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
                 if resp.status_code != 200:
@@ -246,7 +267,7 @@ class LinkedInAIAgent:
                 data = resp.json()
                 text = self._extract_text_from_gemini(data)
                 if not text:
-                    # Show brief preview for debugging and retry with next attempt
+                    # Show brief preview for debugging and try next config
                     print("Gemini response preview:", json.dumps(data)[:600])
                     continue
 
