@@ -72,46 +72,4 @@ class LinkedInAIAgent:
     def resolve_google_news_url(self, link):
         """Extract actual publisher URL from Google News redirect"""
         try:
-            if not link or "news.google.com" not in link:
-                return link
-            
-            parsed = urlparse(link)
-            query_params = parse_qs(parsed.query)
-            
-            if "url" in query_params:
-                return unquote(query_params["url"][0])
-            
-            response = requests.get(link, timeout=8, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
-            final_url = response.url
-            
-            if "news.google.com" not in final_url:
-                return final_url
-                
-            return ""
-        except Exception:
-            return ""
-
-    def fetch_news(self, topic_key, query):
-        """Fetch news and resolve to actual publisher URLs"""
-        rss_url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
-        items = []
-        
-        try:
-            response = requests.get(rss_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            if response.status_code != 200:
-                print(f"News fetch failed: {response.status_code}")
-                return items
-            
-            root = ET.fromstring(response.text)
-            channel = root.find("channel")
-            if channel is None:
-                return items
-            
-            for item in channel.findall("item")[:10]:
-                title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
-                
-                if not title:
-                    continue
-                
-                resolved_link
+            if not
