@@ -39,6 +39,8 @@ class LinkedInAIAgent:
                 "artificial intelligence enterprise",
                 "AI business applications",
                 "machine learning partnerships",
+                "agentic commerce AI agents",
+                "generative AI enterprise",
             ],
             "payments": [
                 "fintech payments partnerships",
