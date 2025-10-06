@@ -41,8 +41,10 @@ class LinkedInAIAgent:
                 content = response.text
                 
                 import re
-                titles = re.findall(r'<title><!\[CDATA\[(.*?)\]\]></title>', content)
+                titles = re.findall(r'<title>(?:<!\[CDATA\[(.*?)\]\]>|(.*?))</title>', content)
+                titles = [t[0] or t[1] for t in titles]
                 links = re.findall(r'<link>(.*?)</link>', content)
+
                 
                 for title, link in zip(titles[1:6], links[1:6]):
                     items.append({'title': title, 'link': link})
@@ -53,16 +55,13 @@ class LinkedInAIAgent:
             return []
     
     def generate_post_with_gemini(self, topic, news_items, include_link):
-        """Generate LinkedIn post using Google Gemini API"""
-        news_context = "\n".join([f"- {item['title']}: {item['link']}" for item in news_items[:3]])
-        
-        link_instruction = ""
-        if include_link:
-            link_instruction = "You MUST include a link to one of the news articles in your post."
-        else:
-            link_instruction = "Do NOT include any links. This should be a thought leadership piece based on current trends."
-        
-        prompt = f"""You are a senior sales leader in tech and fintech with deep expertise in strategic partnerships. Create a LinkedIn post about {topic.replace('_', ' ')}. 
+    """Generate LinkedIn post using Google Gemini 1.5 Flash"""
+    news_context = "\n".join([f"- {item['title']}: {item['link']}" for item in news_items[:3]])
+
+    link_instruction = "You MUST include a link to one of the news articles in your post." if include_link \
+        else "Do NOT include any links. This should be a thought leadership piece based on current trends."
+
+    prompt = f"""You are a senior sales leader in tech and fintech with deep expertise in strategic partnerships. Create a LinkedIn post about {topic.replace('_', ' ')}.
 
 Recent news/trends:
 {news_context}
@@ -70,46 +69,38 @@ Recent news/trends:
 Requirements:
 - 150-250 words
 - Write from the perspective of a senior partnerships executive
-- Professional but conversational, approachable tone
-- Share strategic insights about partnerships, deal-making, or go-to-market strategies
+- Professional but conversational tone
+- Focus on partnerships, deal-making, or GTM strategy
 - {link_instruction}
 - Include 2-3 relevant hashtags at the end
-- Make it engaging and provide real value
-- Share a strong point of view or actionable insight
-- CRITICAL: Do not use em dashes (—) anywhere in the post. Use commas, periods, or colons instead.
+- Share a strong POV or actionable insight
+- CRITICAL: Do not use em dashes (—). Use commas, periods, or colons instead.
 
-Format: Just return the post text, ready to publish."""
+Return only the post text, ready to publish.
+"""
 
-        headers = {
-            'Content-Type': 'application/json'
-        }
-        
-        data = {
-            'contents': [{
-                'parts': [{
-                    'text': prompt
-                }]
-            }],
-            'generationConfig': {
-                'temperature': 0.7,
-                'maxOutputTokens': 600
-            }
-        }
-        
-        api_key = os.getenv('GEMINI_API_KEY')
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={api_key}'
-        
-        try:
-            response = requests.post(url, headers=headers, json=data, timeout=30)
-            
-            if response.status_code == 200:
-                result = response.json()
-                post = result['candidates'][0]['content']['parts'][0]['text']
-                post = post.replace('—', ',').replace('–', ',')
-                return post
-        except Exception as e:
-            print(f"Error generating post: {e}")
-        
+    api_key = os.getenv('GEMINI_API_KEY')
+    url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent'
+    headers = {'Content-Type': 'application/json'}
+    data = {
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": prompt}]
+        }],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 600}
+    }
+
+    try:
+        r = requests.post(f"{url}?key={api_key}", headers=headers, json=data, timeout=45)
+        if r.status_code != 200:
+            print(f"Gemini error {r.status_code}: {r.text}")
+            return None
+        result = r.json()
+        post = result["candidates"][0]["content"]["parts"][0]["text"]
+        post = post.replace('—', ',').replace('–', ',')
+        return post
+    except Exception as e:
+        print(f"Error generating post: {e}")
         return None
     
     def generate_post_with_anthropic(self, topic, news_items, include_link):
