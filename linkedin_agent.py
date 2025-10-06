@@ -13,10 +13,6 @@ class LinkedInAIAgent:
         self.person_urn = os.getenv("LINKEDIN_PERSON_URN", "").strip()
         self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
 
-        # Gemini endpoint cache
-        self.gemini_api_version = None
-        self.gemini_model = None
-
         # Topic rotation
         self.topics = {
             "tech_partnerships": [
@@ -124,57 +120,12 @@ class LinkedInAIAgent:
         return items
 
     # -----------------------------
-    # Gemini model resolution
-    # -----------------------------
-    def resolve_gemini_endpoint(self):
-        if self.gemini_api_version and self.gemini_model:
-            return
-
-        prefs = [
-            "gemini-2.5-flash",
-            "gemini-1.5-flash-latest",
-            "gemini-1.5-flash",
-            "gemini-1.5-pro-latest",
-            "gemini-1.5-pro",
-            "gemini-pro",
-        ]
-
-        for api_version in ["v1", "v1beta"]:
-            try:
-                url = f"https://generativelanguage.googleapis.com/{api_version}/models?key={self.gemini_key}"
-                r = requests.get(url, timeout=12)
-                if r.status_code != 200:
-                    continue
-                models = r.json().get("models", [])
-                available = {m.get("name", "").split("/")[-1]: m for m in models}
-
-                chosen = None
-                for name in prefs:
-                    m = available.get(name)
-                    if not m:
-                        continue
-                    methods = m.get("supportedGenerationMethods", [])
-                    if not methods or "generateContent" in methods:
-                        chosen = name
-                        break
-
-                if chosen:
-                    self.gemini_api_version = api_version
-                    self.gemini_model = chosen
-                    print(f"Using Gemini model: {chosen} on {api_version}")
-                    return
-            except Exception as e:
-                print(f"Model list error on {api_version}: {e}")
-                continue
-
-        self.gemini_api_version = "v1"
-        self.gemini_model = "gemini-pro"
-        print("Falling back to Gemini model: gemini-pro on v1")
-
-    # -----------------------------
-    # Gemini generation with retries and prompt shrinking
+    # Gemini generation
     # -----------------------------
     def _extract_text_from_gemini(self, payload):
+        """
+        Robustly extract text across response shapes. Returns None if empty.
+        """
         try:
             cand = payload["candidates"][0]
         except Exception:
@@ -191,18 +142,11 @@ class LinkedInAIAgent:
             texts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
             if any(texts):
                 return "\n".join(t for t in texts if t)
-        msg = cand.get("message", {})
-        if isinstance(msg, dict):
-            mcontent = msg.get("content")
-            if isinstance(mcontent, list):
-                texts = [p.get("text", "") for p in mcontent if isinstance(p, dict) and "text" in p]
-                if any(texts):
-                    return "\n".join(t for t in texts if t)
         if "text" in cand:
             return cand["text"]
         return None
 
-    def _build_prompt(self, topic_key, news_items, include_link, keep=2):
+    def _build_prompt(self, topic_key, news_items, include_link, keep=2, words_low=130, words_high=170):
         # Keep the prompt lean to avoid MAX_TOKENS
         trimmed = []
         for it in news_items[:keep]:
@@ -222,45 +166,77 @@ class LinkedInAIAgent:
         prompt = (
             f"Write a LinkedIn post from a senior tech and fintech partnerships leader about "
             f"{topic_key.replace('_', ' ')}.\n\n"
-            f"Use 150 to 190 words. Make it concrete, strategic, and useful for BD and GTM leaders. "
-            f"No em dashes. Add two or three relevant hashtags at the end. "
+            f"Keep it {words_low} to {words_high} words. Make it concrete, strategic, and useful for BD and GTM leaders. "
+            f"Do not use em dashes. Add two or three relevant hashtags at the end. "
             f"{link_instruction}\n\n"
             f"Recent items:\n{news_context}\n\n"
             f"Return only the post text."
         )
         return prompt
 
+    def _models_available(self, api_version):
+        try:
+            url = f"https://generativelanguage.googleapis.com/{api_version}/models?key={self.gemini_key}"
+            r = requests.get(url, timeout=12)
+            if r.status_code != 200:
+                return {}
+            models = r.json().get("models", [])
+            return {m.get("name", "").split("/")[-1]: m for m in models}
+        except Exception:
+            return {}
+
     def generate_post_with_gemini(self, topic_key, news_items, include_link):
-        self.resolve_gemini_endpoint()
-
-        base = (
-            f"https://generativelanguage.googleapis.com/"
-            f"{self.gemini_api_version}/models/{self.gemini_model}:generateContent"
-        )
-        headers = {"Content-Type": "application/json"}
-
-        # Retry strategy: shrink context, then fallback model
+        """
+        Retry strategy:
+          1) v1 gemini-2.5-flash, larger output budget
+          2) v1 gemini-2.5-flash with tighter prompt
+          3) v1beta gemini-1.5-flash-latest
+          4) v1beta gemini-1.5-flash with very tight prompt
+        """
         attempts = [
-            {"keep": 2, "max_tokens": 300, "model": None},
-            {"keep": 1, "max_tokens": 260, "model": None},
-            {"keep": 0, "max_tokens": 240, "model": "gemini-pro"},
+            {"api": "v1", "model": "gemini-2.5-flash", "keep": 2, "max_out": 900, "words": (130, 170)},
+            {"api": "v1", "model": "gemini-2.5-flash", "keep": 1, "max_out": 700, "words": (120, 160)},
+            {"api": "v1beta", "model": "gemini-1.5-flash-latest", "keep": 2, "max_out": 800, "words": (130, 170)},
+            {"api": "v1beta", "model": "gemini-1.5-flash", "keep": 1, "max_out": 650, "words": (110, 150)},
         ]
 
-        for i, step in enumerate(attempts, start=1):
-            if step["model"]:
-                self.gemini_model = step["model"]
-                self.gemini_api_version = "v1"
-                base = (
-                    f"https://generativelanguage.googleapis.com/"
-                    f"{self.gemini_api_version}/models/{self.gemini_model}:generateContent"
-                )
+        # Filter attempts by actual availability
+        cache = {}
+        filtered = []
+        for a in attempts:
+            if a["api"] not in cache:
+                cache[a["api"]] = self._models_available(a["api"])
+            if a["model"] in cache[a["api"]]:
+                filtered.append(a)
+        if not filtered:
+            print("No suitable Gemini models available from ListModels.")
+            return None
 
-            prompt = self._build_prompt(topic_key, news_items, include_link, keep=step["keep"])
+        headers = {"Content-Type": "application/json"}
+
+        for i, step in enumerate(filtered, start=1):
+            base = (
+                f"https://generativelanguage.googleapis.com/"
+                f"{step['api']}/models/{step['model']}:generateContent"
+            )
+            prompt = self._build_prompt(
+                topic_key,
+                news_items,
+                include_link,
+                keep=step["keep"],
+                words_low=step["words"][0],
+                words_high=step["words"][1],
+            )
             body = {
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.7, "maxOutputTokens": step["max_tokens"]},
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": step["max_out"],
+                    # keep minimal to avoid 400s on unsupported fields
+                },
             }
 
+            print(f"Attempt {i}: {step['model']} on {step['api']} with maxOutputTokens={step['max_out']}")
             try:
                 resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
                 if resp.status_code != 200:
@@ -270,7 +246,7 @@ class LinkedInAIAgent:
                 data = resp.json()
                 text = self._extract_text_from_gemini(data)
                 if not text:
-                    # Preview for debugging, then retry with smaller prompt
+                    # Show brief preview for debugging and retry with next attempt
                     print("Gemini response preview:", json.dumps(data)[:600])
                     continue
 
