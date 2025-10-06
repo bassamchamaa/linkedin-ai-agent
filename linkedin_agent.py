@@ -3,6 +3,8 @@ import json
 import re
 import random
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs, unquote
+import xml.etree.ElementTree as ET
 import requests
 
 
@@ -39,6 +41,16 @@ class LinkedInAIAgent:
             print("LinkedIn secrets missing. Check LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN.")
         if not self.gemini_key and not self.openai_key:
             print("No model key found. Set GEMINI_API_KEY or OPENAI_API_KEY.")
+
+    # -----------------------------
+    # Style helpers
+    # -----------------------------
+    def enforce_style_rules(self, text):
+        # No em or en dashes, no semicolons
+        text = text.replace("—", ",").replace("–", ",").replace(";", ",")
+        # Kill “As a …” openers
+        text = re.sub(r"^\s*As a [^.!\n]+[, ]+", "", text, flags=re.IGNORECASE)
+        return text.strip()
 
     # -----------------------------
     # State helpers
@@ -81,10 +93,58 @@ class LinkedInAIAgent:
         state["last_topics"] = last_topics
         return next_topic, state
 
-    def enforce_style_rules(self, text):
-        # No em or en dashes
-        text = text.replace("—", ",").replace("–", ",")
-        return text.strip()
+    # -----------------------------
+    # URL resolution
+    # -----------------------------
+    def _extract_original_from_link(self, link):
+        """
+        Google News links can be:
+          - Aggregator with ?url= param
+          - /rss/articles/... that 302s to the publisher
+          - Plain news.google.com
+        We try query param, then follow redirects, else return original.
+        """
+        try:
+            if not link:
+                return ""
+
+            parsed = urlparse(link)
+            if "news.google.com" not in parsed.netloc:
+                return link  # already a publisher link
+
+            # If there's a url= param, prefer it
+            q = parse_qs(parsed.query)
+            if "url" in q and q["url"]:
+                return unquote(q["url"][0])
+
+            # Try resolving redirects to publisher
+            try:
+                r = requests.get(link, timeout=10, allow_redirects=True, headers={"User-Agent": "curl/8"})
+                final_url = r.url
+                if final_url and "news.google.com" not in urlparse(final_url).netloc:
+                    return final_url
+            except Exception:
+                pass
+
+            return link  # fallback
+        except Exception:
+            return link
+
+    def _extract_publisher_from_description(self, description):
+        """
+        Some RSS items embed a publisher link inside <description>.
+        Grab the first http(s) link that is not news.google.com.
+        """
+        if not description:
+            return ""
+        try:
+            urls = re.findall(r'href="(https?://[^"]+)"', description)
+            for u in urls:
+                if "news.google.com" not in urlparse(u).netloc:
+                    return u
+        except Exception:
+            pass
+        return ""
 
     # -----------------------------
     # News fetch via Google News RSS
@@ -93,27 +153,32 @@ class LinkedInAIAgent:
         rss = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
         items = []
         try:
-            r = requests.get(rss, timeout=12)
+            r = requests.get(rss, timeout=12, headers={"User-Agent": "curl/8"})
             if r.status_code != 200:
                 print(f"News fetch error {r.status_code} for {topic_key}: {r.text[:200]}")
                 return items
 
-            content = r.text
-            titles_raw = re.findall(r"<title>(?:<!\[CDATA\[(.*?)\]\]>|(.*?))</title>", content, flags=re.I | re.S)
-            titles = [(a or b) for a, b in titles_raw]
-            links = re.findall(r"<link>(.*?)</link>", content, flags=re.I | re.S)
+            root = ET.fromstring(r.text)
+            channel = root.find("channel")
+            if channel is None:
+                return items
 
-            # Skip the feed title line
-            paired = list(zip(titles[1:], links[1:]))[:max_items]
-            for title, link in paired:
-                # Unwrap Google redirect to the original URL
-                if "news.google.com" in link and "url=" in link:
-                    m = re.search(r"[?&]url=([^&]+)", link)
-                    if m:
-                        link = requests.utils.unquote(m.group(1))
-                items.append({"title": title.strip(), "link": link.strip()})
+            for it in channel.findall("item")[: max_items * 2]:
+                title = (it.findtext("title") or "").strip()
+                link = (it.findtext("link") or "").strip()
+                desc = (it.findtext("description") or "").strip()
+
+                # Prefer publisher link from description
+                publisher_link = self._extract_publisher_from_description(desc)
+                best = publisher_link or self._extract_original_from_link(link)
+
+                items.append({"title": title, "link": best})
+
+                if len(items) >= max_items:
+                    break
+
         except Exception as e:
-            print(f"Error fetching news for {topic_key}: {e}")
+            print(f"Error parsing RSS for {topic_key}: {e}")
 
         if not items:
             print(f"⚠ No news found for {topic_key}, using fallback.")
@@ -127,21 +192,24 @@ class LinkedInAIAgent:
         trimmed = []
         for it in news_items[:keep]:
             title = it["title"][:110] + ("..." if len(it["title"]) > 110 else "")
-            link_part = f" | {it['link']}" if it.get("link") else ""
+            link = it.get("link") or ""
+            # Only include specific publisher links in the prompt context
+            link_part = f" | {link}" if link and "news.google.com" not in link else ""
             trimmed.append(f"- {title}{link_part}")
 
         news_context = "\n".join(trimmed)
         link_instruction = (
-            "Include exactly one news link in the body."
-            if include_link and any(x.get("link") for x in news_items)
+            "Include exactly one publisher link in the body."
+            if include_link and any(x.get("link") and "news.google.com" not in x["link"] for x in news_items)
             else "Do not include any links."
         )
 
         prompt = (
-            f"Write a LinkedIn post from a senior tech and fintech partnerships leader about "
-            f"{topic_key.replace('_', ' ')}.\n\n"
-            f"Keep it {words_low} to {words_high} words. Make it concrete, strategic, and useful for BD and GTM leaders. "
-            f"Do not use em dashes. Add two or three relevant hashtags at the end. "
+            f"Write a LinkedIn post from a senior sales leader in tech and fintech who favors partnerships. "
+            f"Topic: {topic_key.replace('_', ' ')}.\n\n"
+            f"Keep it {words_low} to {words_high} words. Be direct, practical, and human. "
+            f"Avoid generic set-ups like 'As a ...'. No em dashes. No semicolons. "
+            f"End with two or three relevant hashtags. "
             f"{link_instruction}\n\n"
             f"Recent items:\n{news_context}\n\n"
             f"Return only the post text."
@@ -149,8 +217,29 @@ class LinkedInAIAgent:
         return prompt
 
     # -----------------------------
-    # Gemini generation (no ListModels, try known models directly)
+    # Gemini generation (try known models directly)
     # -----------------------------
+    def _extract_text_from_gemini(self, payload):
+        try:
+            cand = payload["candidates"][0]
+        except Exception:
+            return None
+
+        content = cand.get("content")
+        if isinstance(content, dict):
+            parts = content.get("parts")
+            if isinstance(parts, list):
+                texts = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
+                if any(texts):
+                    return "\n".join(t for t in texts if t)
+        if isinstance(content, list):
+            texts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
+            if any(texts):
+                return "\n".join(t for t in texts if t)
+        if "text" in cand:
+            return cand["text"]
+        return None
+
     def generate_post_with_gemini(self, topic_key, news_items, include_link):
         if not self.gemini_key:
             return None
@@ -183,8 +272,7 @@ class LinkedInAIAgent:
             try:
                 resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
                 if resp.status_code == 404:
-                    # Model not available under this key or API version, try next
-                    print(f"Model not found on attempt {i}: {step['model']} ({resp.status_code})")
+                    print(f"Model not found on attempt {i}: {step['model']}")
                     continue
                 if resp.status_code != 200:
                     print(f"Gemini error {resp.status_code} on attempt {i}: {resp.text[:600]}")
@@ -193,7 +281,6 @@ class LinkedInAIAgent:
                 data = resp.json()
                 text = self._extract_text_from_gemini(data)
                 if not text:
-                    # likely MAX_TOKENS with hidden thoughts, try next attempt
                     fr = None
                     try:
                         fr = data["candidates"][0].get("finishReason")
@@ -206,14 +293,18 @@ class LinkedInAIAgent:
 
                 text = self.enforce_style_rules(text)
 
+                # Ensure any included link is a real publisher URL
                 if include_link:
                     has_link = "http://" in text or "https://" in text
                     if not has_link:
-                        for it in news_items:
-                            if it.get("link"):
-                                text += f"\n\n{it['link']}"
-                                break
-                        text = self.enforce_style_rules(text)
+                        good = next((it["link"] for it in news_items
+                                     if it.get("link") and "news.google.com" not in it["link"]), "")
+                        if good:
+                            text += f"\n\n{good}"
+                            text = self.enforce_style_rules(text)
+                        else:
+                            # No clean publisher link, switch to thought piece
+                            text = re.sub(r"\nhttps?://\S+$", "", text).strip()
 
                 return text
 
@@ -231,31 +322,28 @@ class LinkedInAIAgent:
             return None
 
         news_context = "\n".join(
-            f"- {it['title'][:110]}{'...' if len(it['title'])>110 else ''}{' | ' + it['link'] if it.get('link') else ''}"
+            f"- {it['title'][:110]}{'...' if len(it['title'])>110 else ''}"
+            f"{' | ' + it['link'] if it.get('link') and 'news.google.com' not in it['link'] else ''}"
             for it in news_items[:2]
         )
         link_instruction = (
-            "Include exactly one news link in the body."
-            if include_link and any(x.get("link") for x in news_items)
+            "Include exactly one publisher link in the body."
+            if include_link and any(x.get("link") and "news.google.com" not in x["link"] for x in news_items)
             else "Do not include any links."
         )
         prompt = (
-            f"Write a LinkedIn post from a senior tech and fintech partnerships leader about "
-            f"{topic_key.replace('_', ' ')}.\n\n"
-            f"Keep it 120 to 160 words. Make it concrete and strategic for BD and GTM leaders. "
-            f"Do not use em dashes. Add two or three relevant hashtags at the end. "
+            f"Write a LinkedIn post from a senior sales leader in tech and fintech who favors partnerships. "
+            f"Topic: {topic_key.replace('_', ' ')}.\n\n"
+            f"Keep it 120 to 160 words. Be direct, practical, and human. "
+            f"Avoid generic set-ups like 'As a ...'. No em dashes. No semicolons. "
+            f"End with two or three relevant hashtags. "
             f"{link_instruction}\n\n"
             f"Recent items:\n{news_context}\n\n"
             f"Return only the post text."
         )
 
         headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-        body = {
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7,
-            "max_tokens": 450,
-        }
+        body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 450}
         try:
             r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=45)
             if r.status_code != 200:
@@ -263,43 +351,35 @@ class LinkedInAIAgent:
                 return None
             text = r.json()["choices"][0]["message"]["content"]
             text = self.enforce_style_rules(text)
+
             if include_link and ("http://" not in text and "https://" not in text):
-                for it in news_items:
-                    if it.get("link"):
-                        text += f"\n\n{it['link']}"
-                        break
-                text = self.enforce_style_rules(text)
+                good = next((it["link"] for it in news_items if it.get("link") and "news.google.com" not in it["link"]), "")
+                if good:
+                    text += f"\n\n{good}"
+                    text = self.enforce_style_rules(text)
             return text
         except Exception as e:
             print(f"OpenAI call failed: {e}")
             return None
 
     # -----------------------------
-    # Last ditch local generator
+    # Last-ditch local generator
     # -----------------------------
     def generate_post_locally(self, topic_key, news_items, include_link):
-        bullets = []
-        for it in news_items[:2]:
-            t = it["title"][:100] + ("..." if len(it["title"]) > 100 else "")
-            bullets.append(t)
-        core = (
-            f"As a partnerships leader, I look for signals that reduce risk and speed adoption. "
-            f"Two things stand out right now: {bullets[0] if bullets else 'customer-led integrations'} "
-            f"and {bullets[1] if len(bullets) > 1 else 'clear ROI stories'}. "
-            f"The playbook is the same, start with a concrete customer use case, "
-            f"co-sell with your partner, measure the revenue impact, then scale."
+        bullets = [it["title"] for it in news_items[:2]]
+        hook = "Partnerships deliver when the motion is clear, measurable, and repeatable."
+        insight = (
+            f"Right now I’m seeing faster wins when teams anchor around one customer use case, "
+            f"ship a tight integration, co-sell with the partner, and report the revenue impact in the same dashboard."
         )
+        close = "Pick a single motion, get proof fast, then scale across your partner ecosystem."
         link_line = ""
         if include_link:
-            for it in news_items:
-                if it.get("link"):
-                    link_line = f"\n\n{it['link']}"
-                    break
+            good = next((it["link"] for it in news_items if it.get("link") and "news.google.com" not in it["link"]), "")
+            if good:
+                link_line = f"\n\n{good}"
         post = (
-            f"{topic_key.replace('_', ' ').title()}: teams win on clarity, not noise. "
-            f"{core} "
-            f"Partnerships create leverage when both sides commit resources and share a joint success metric. "
-            f"Pick one motion, make it repeatable, then go wider.\n\n"
+            f"{hook} {insight} {close}\n\n"
             f"#partnerships #busdev #fintech{link_line}"
         )
         return self.enforce_style_rules(post)
@@ -359,7 +439,7 @@ class LinkedInAIAgent:
 
         topic_key, state = self.get_next_topic(state)
         include_link = random.random() < 0.6
-        post_type = "with reference link" if include_link else "thought leadership piece"
+        post_type = "with publisher link" if include_link else "thought leadership piece"
 
         print(f"--- Topic: {topic_key.replace('_', ' ').title()} ({post_type}) ---")
         query = random.choice(self.topics[topic_key])
@@ -367,7 +447,12 @@ class LinkedInAIAgent:
         news_items = self.fetch_news(topic_key, query)
         print(f"Found {len(news_items)} news items")
 
-        # Generate with Gemini, else OpenAI, else local template
+        # If we decided to include a link but none of the items has a clean publisher link, flip to thought piece
+        if include_link and not any(it.get("link") and "news.google.com" not in it["link"] for it in news_items):
+            include_link = False
+            print("No clean publisher link found, switching to thought leadership.")
+
+        # Generate with Gemini, else OpenAI, else local
         post_text = None
         if self.gemini_key:
             print("Generating post with Gemini...")
