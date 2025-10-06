@@ -28,7 +28,7 @@ class LinkedInAIAgent:
         self.openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.force_post = os.getenv("FORCE_POST", "").strip() == "1"
 
-        # Core topics plus your three new ones
+        # Topics, now including your new ones
         self.topics = {
             "tech_partnerships": [
                 "technology partnerships business development",
@@ -62,14 +62,14 @@ class LinkedInAIAgent:
             ],
         }
 
-        # Topic aware hashtag pools
+        # Curated, high-impact hashtags in priority order
         self.topic_tags = {
-            "tech_partnerships": ["#partnerships", "#busdev", "#GTM", "#SaaS"],
-            "ai": ["#AI", "#EnterpriseAI", "#B2B", "#GTM"],
-            "payments": ["#fintech", "#payments", "#partnerships", "#B2B"],
-            "agentic_commerce": ["#agenticAI", "#ecommerce", "#CX"],
-            "generative_ai": ["#GenerativeAI", "#LLM", "#EnterpriseAI"],
-            "ai_automations": ["#automation", "#AIagents", "#ops"],
+            "tech_partnerships": ["#partnerships", "#busdev", "#GTM", "#SaaS", "#ecosystem"],
+            "ai": ["#AI", "#EnterpriseAI", "#B2B", "#GTM", "#ML"],
+            "payments": ["#fintech", "#payments", "#B2B", "#partnerships", "#risk"],
+            "agentic_commerce": ["#agenticAI", "#ecommerce", "#CX", "#conversion"],
+            "generative_ai": ["#GenerativeAI", "#LLM", "#EnterpriseAI", "#product"],
+            "ai_automations": ["#automation", "#AIagents", "#ops", "#productivity"],
         }
 
         self.state_file = "agent_state.json"
@@ -104,9 +104,6 @@ class LinkedInAIAgent:
 
     def ends_cleanly(self, text: str) -> bool:
         return bool(re.search(r'[.!?]"?\s*$', text))
-
-    def has_hashtags(self, text: str) -> bool:
-        return len(re.findall(r"(?:^|\s)#\w+", text)) >= 2
 
     # ---------- State ----------
 
@@ -143,7 +140,6 @@ class LinkedInAIAgent:
             last_topics = []
             available = list(self.topics.keys())
         next_topic = random.choice(available)
-        # keep memory of the last three to reduce repeats now that we have more topics
         last_topics.append(next_topic)
         if len(last_topics) > 3:
             last_topics = last_topics[-3:]
@@ -297,7 +293,6 @@ class LinkedInAIAgent:
             {"api": "v1beta", "model": "gemini-1.5-flash-latest", "keep": 2, "max_out": 520, "words": (130, 180)},
             {"api": "v1",     "model": "gemini-2.5-flash",        "keep": 1, "max_out": 600, "words": (130, 180)},
         ]
-
         headers = {"Content-Type": "application/json"}
 
         for i, step in enumerate(attempts, start=1):
@@ -310,7 +305,6 @@ class LinkedInAIAgent:
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0.7, "maxOutputTokens": step["max_out"]},
             }
-
             print(f"Attempt {i}: {step['model']} on {step['api']} with maxOutputTokens={step['max_out']}")
             try:
                 resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
@@ -383,8 +377,8 @@ class LinkedInAIAgent:
         prompt = (
             "Edit the LinkedIn post to improve grammar, flow, and clarity. "
             "Keep the same ideas and facts. Do not add or remove URLs. "
-            "Keep hashtags at the end on their own line. No em dashes. No semicolons. "
-            "Return only the edited text.\n\n"
+            "Remove any hashtags you see. Keep a neutral, senior voice. "
+            "No em dashes. No semicolons. Return only the edited text.\n\n"
             f"Post:\n{text}"
         )
         try:
@@ -409,58 +403,68 @@ class LinkedInAIAgent:
             print(f"Polish pass skipped due to error: {e}")
         return self.enforce_style_rules(self.debuzz(text))
 
-    # ---------- Local fallback and guarantees ----------
+    # ---------- Final assembly ----------
 
-    def local_compose(self, topic_key: str, include_link: bool, news_items) -> str:
-        hooks = {
-            "tech_partnerships": "Partnerships work when both teams invest real resources and chase one metric together.",
-            "ai": "AI wins in the enterprise when it reduces time to value, not just cost.",
-            "payments": "Payments is a trust business. Speed and acceptance matter, proof beats promises.",
-            "agentic_commerce": "Agentic commerce turns browsing into doing. The best agents remove steps, not just clicks.",
-            "generative_ai": "Generative AI helps when it is paired with data quality and strong guardrails.",
-            "ai_automations": "Automation shines when it owns the boring work and hands off the tough parts clearly.",
-        }
-        hook = hooks.get(topic_key, "Clarity beats noise.")
-        insight = (
-            "Start with one use case, instrument outcomes, share the numbers weekly, then scale the playbook with partners."
-        )
-        text = f"{hook} {insight}"
-        if include_link:
-            link = self.pick_publisher_link(news_items)
-            if link:
-                text += f"\n\n{link}"
-        return self.enforce_style_rules(self.debuzz(text))
-
-    def ensure_hashtags_and_layout(self, text: str, topic_key: str, include_link: bool, news_items) -> str:
-        text = self.enforce_style_rules(self.debuzz(text)).strip()
-
-        # Finish sentence if clipped
-        if not self.ends_cleanly(text):
-            text = text.rstrip(' "\n') + "."
-
-        # Min length guard, then link placement
-        word_count = len(re.findall(r"\b\w+\b", text))
-        if word_count < 110:
-            # pad with a concise tip
-            tip = " Focus on one measurable outcome, make it repeatable, then scale with the right partners."
-            text += tip
-        if include_link and ("http://" not in text and "https://" not in text):
-            good = self.pick_publisher_link(news_items)
-            if good:
-                text += f"\n\n{good}"
-
-        # Hashtag line
-        if not self.has_hashtags(text):
-            pool = self.topic_tags.get(topic_key, ["#partnerships", "#busdev"])
-            chosen = []
-            for tag in pool:
+    def curated_hashtags(self, topic_key: str, body: str) -> str:
+        pool = self.topic_tags.get(topic_key, ["#partnerships", "#busdev", "#B2B"])
+        # Keep order of impact, drop any already present as words
+        chosen = []
+        lower = body.lower()
+        for tag in pool:
+            if tag.lower() in lower:
+                continue
+            chosen.append(tag)
+            if len(chosen) == 3:
+                break
+        if len(chosen) < 2:  # guarantee at least 2
+            for tag in ["#B2B", "#GTM", "#AI"]:
                 if tag not in chosen:
                     chosen.append(tag)
                 if len(chosen) == 3:
                     break
-            text += "\n\n" + " ".join(chosen)
+        return " ".join(chosen[:3])
 
-        return self.enforce_style_rules(self.debuzz(text))
+    def dedupe_sentences(self, text: str) -> str:
+        parts = re.split(r'(?<=[.!?])\s+', text.strip())
+        seen = set()
+        clean = []
+        for s in parts:
+            key = s.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                clean.append(s.strip())
+        return " ".join(clean)
+
+    def sanitize_and_finalize(self, body: str, topic_key: str, include_link: bool, news_items):
+        # Remove any hashtag-only lines and inline hashtags from the model
+        lines = [ln for ln in body.splitlines() if not re.fullmatch(r'\s*(#\w+\s*){2,}\s*', ln.strip())]
+        body = "\n".join(lines)
+        body = re.sub(r'(?<!\w)#\w+', "", body)  # strip inline hashtags
+        body = self.enforce_style_rules(self.debuzz(body)).strip()
+
+        # Truncate anything after a hashtag line if the model slipped one in
+        m = re.search(r'(^|\n)\s*(#\w+(?:\s+#\w+){1,})\s*$', body, flags=re.IGNORECASE | re.MULTILINE)
+        if m:
+            body = body[: m.start()].rstrip()
+
+        # Ensure clean ending and remove duplicates
+        body = self.dedupe_sentences(body)
+        if not self.ends_cleanly(body):
+            body = body.rstrip(' "\n') + "."
+
+        # Add link on its own line if requested and available
+        link_line = ""
+        if include_link:
+            good = self.pick_publisher_link(news_items)
+            if good:
+                link_line = f"\n\n{good}"
+
+        # Curated hashtag line last, nothing after it
+        tags = self.curated_hashtags(topic_key, body)
+        hashtags_line = f"\n\n{tags}" if tags else ""
+
+        final_text = body + link_line + hashtags_line
+        return self.enforce_style_rules(self.debuzz(final_text)).strip()
 
     # ---------- LinkedIn ----------
 
@@ -527,24 +531,25 @@ class LinkedInAIAgent:
             include_link = False
             print("No clean publisher link found, switching to linkless piece.")
 
-        post_text = None
+        # Generate body
+        post_body = None
         if self.gemini_key:
             print("Generating with Gemini")
-            post_text = self.generate_post_with_gemini(topic_key, news_items, include_link, tone)
-        if not post_text and self.openai_key:
+            post_body = self.generate_post_with_gemini(topic_key, news_items, include_link, tone)
+        if not post_body and self.openai_key:
             print("Fallback to OpenAI")
-            post_text = self.generate_post_with_openai(topic_key, news_items, include_link, tone)
-        if not post_text:
+            post_body = self.generate_post_with_openai(topic_key, news_items, include_link, tone)
+        if not post_body:
             print("Models failed, composing locally")
-            post_text = self.local_compose(topic_key, include_link, news_items)
+            post_body = self.local_compose(topic_key, include_link, news_items=None)
 
-        post_text = self.ensure_hashtags_and_layout(post_text, topic_key, include_link, news_items)
-        post_text = self.polish_with_model(post_text)
-        post_text = self.ensure_hashtags_and_layout(post_text, topic_key, include_link, news_items)
+        # Polish then finalize once to avoid duplicates after hashtags
+        post_body = self.polish_with_model(post_body)
+        final_text = self.sanitize_and_finalize(post_body, topic_key, include_link, news_items)
 
-        print("\nGenerated post\n" + "-" * 60 + f"\n{post_text}\n" + "-" * 60)
+        print("\nGenerated post\n" + "-" * 60 + f"\n{final_text}\n" + "-" * 60)
 
-        ok = self.post_to_linkedin(post_text)
+        ok = self.post_to_linkedin(final_text)
         if ok:
             state["post_count"] = state.get("post_count", 0) + 1
             state["last_post_date"] = datetime.now().strftime("%Y-%m-%d")
@@ -552,6 +557,21 @@ class LinkedInAIAgent:
             print(f"Success. Total posts: {state['post_count']}")
         else:
             print("Publish failed")
+
+    # ---------- Local fallback ----------
+
+    def local_compose(self, topic_key: str, include_link: bool, news_items):
+        hooks = {
+            "tech_partnerships": "Partnerships work when both teams invest real resources and chase one metric together.",
+            "ai": "AI wins in the enterprise when it reduces time to value, not just cost.",
+            "payments": "Payments is a trust business. Speed and acceptance matter, proof beats promises.",
+            "agentic_commerce": "Agentic commerce turns browsing into doing. The best agents remove steps, not just clicks.",
+            "generative_ai": "Generative AI helps when it is paired with data quality and strong guardrails.",
+            "ai_automations": "Automation shines when it owns the boring work and hands off the tough parts clearly.",
+        }
+        hook = hooks.get(topic_key, "Clarity beats noise.")
+        insight = "Start with one use case, instrument outcomes, share the numbers weekly, then scale the playbook with partners."
+        return self.enforce_style_rules(self.debuzz(f"{hook} {insight}"))
 
 
 if __name__ == "__main__":
