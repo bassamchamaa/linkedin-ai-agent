@@ -1,0 +1,61 @@
+name: LinkedIn AI Agent
+
+on:
+  schedule:
+    # Post 3 times per week: Monday, Wednesday, Friday
+    # Key engagement times in ET (converted to UTC: ET + 4/5 hours depending on DST)
+    # Currently set for EDT (ET + 4 hours). Adjust for EST by adding 5 hours.
+    
+    # Early morning engagement (7-9 AM ET = 11 AM-1 PM UTC)
+    - cron: '0 11 * * 1'   # Monday 7 AM ET
+    - cron: '30 11 * * 1'  # Monday 7:30 AM ET
+    - cron: '0 12 * * 1'   # Monday 8 AM ET
+    - cron: '0 13 * * 1'   # Monday 9 AM ET
+    
+    # Lunch hour engagement (12-1 PM ET = 4-5 PM UTC)
+    - cron: '0 16 * * 3'   # Wednesday 12 PM ET
+    - cron: '15 16 * * 3'  # Wednesday 12:15 PM ET
+    - cron: '30 16 * * 3'  # Wednesday 12:30 PM ET
+    - cron: '0 17 * * 3'   # Wednesday 1 PM ET
+    
+    # Friday morning engagement (7-9 AM ET = 11 AM-1 PM UTC)
+    - cron: '0 11 * * 5'   # Friday 7 AM ET
+    - cron: '30 11 * * 5'  # Friday 7:30 AM ET
+    - cron: '0 12 * * 5'   # Friday 8 AM ET
+    - cron: '0 13 * * 5'   # Friday 9 AM ET
+    
+  workflow_dispatch:  # Allows manual trigger
+
+jobs:
+  post-to-linkedin:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install requests
+    
+    - name: Run LinkedIn Agent
+      env:
+        LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
+        LINKEDIN_PERSON_URN: ${{ secrets.LINKEDIN_PERSON_URN }}
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        # OR use: OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      run: |
+        python linkedin_agent.py
+    
+    - name: Commit state file
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add agent_state.json || true
+        git commit -m "Update agent state" || true
+        git push || true
