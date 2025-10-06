@@ -191,16 +191,17 @@ class LinkedInAIAgent:
     # Gemini generation
     # -----------------------------
     def generate_post_with_gemini(self, topic_key, news_items, include_link):
-        self.resolve_gemini_endpoint()
+    # Make sure we have a working model + API version
+    self.resolve_gemini_endpoint()
 
-        news_context = "\n".join([f"- {i['title']}: {i['link']}" for i in news_items[:3]])
-        link_instruction = (
-            "You MUST include exactly one link to one of the news articles in the body of the post."
-            if include_link and any(x.get("link") for x in news_items)
-            else "Do NOT include any links. This should be a thought leadership piece based on current trends."
-        )
+    news_context = "\n".join([f"- {i['title']}: {i['link']}" for i in news_items[:3]])
+    link_instruction = (
+        "You MUST include exactly one link to one of the news articles in the body of the post."
+        if include_link and any(x.get("link") for x in news_items)
+        else "Do NOT include any links. This should be a thought leadership piece based on current trends."
+    )
 
-        prompt = f"""You are a senior sales leader in tech and fintech with deep expertise in strategic partnerships. Create a LinkedIn post about {topic_key.replace('_', ' ')}.
+    prompt = f"""You are a senior sales leader in tech and fintech with deep expertise in strategic partnerships. Create a LinkedIn post about {topic_key.replace('_', ' ')}.
 
 Recent news and trends:
 {news_context}
@@ -216,39 +217,61 @@ Requirements:
 - Return only the post text, ready to publish.
 """
 
-        base = f"https://generativelanguage.googleapis.com/{self.gemini_api_version}/models/{self.gemini_model}:generateContent"
-        headers = {"Content-Type": "application/json"}
-        body = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": prompt}],
-                }
-            ],
-            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 600},
-        }
+    base = f"https://generativelanguage.googleapis.com/{self.gemini_api_version}/models/{self.gemini_model}:generateContent"
+    headers = {"Content-Type": "application/json"}
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 600},
+    }
 
-        try:
-            resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
-            if resp.status_code != 200:
-                print(f"Gemini error {resp.status_code}: {resp.text[:400]}")
-                return None
-            data = resp.json()
-            post = data["candidates"][0]["content"]["parts"][0]["text"]
-            post = self.enforce_style_rules(post)
-
-            if include_link:
-                has_link = "http://" in post or "https://" in post
-                if not has_link:
-                    for it in news_items:
-                        if it.get("link"):
-                            post += f"\n\n{it['link']}"
-                            break
-                    post = self.enforce_style_rules(post)
-            return post
-        except Exception as e:
-            print(f"Error generating post: {e}")
+    try:
+        resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
+        if resp.status_code != 200:
+            print(f"Gemini error {resp.status_code}: {resp.text[:600]}")
             return None
+
+        data = resp.json()
+
+        # Robust extraction across response shapes
+        post = None
+        try:
+            # Common shape
+            post = data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            try:
+                # Sometimes content is a list
+                post = data["candidates"][0]["content"][0]["text"]
+            except Exception:
+                try:
+                    # Some models put text under candidates.message
+                    post = data["candidates"][0]["message"]["content"][0]["text"]
+                except Exception:
+                    # Last resort, print a preview to the log for debugging
+                    print("Gemini response preview:", json.dumps(data)[:600])
+                    return None
+
+        post = self.enforce_style_rules(post)
+
+        if include_link:
+            has_link = "http://" in post or "https://" in post
+            if not has_link:
+                for it in news_items:
+                    if it.get("link"):
+                        post += f"\n\n{it['link']}"
+                        break
+                post = self.enforce_style_rules(post)
+
+        return post
+
+    except Exception as e:
+        print(f"Error generating post: {e}")
+        return None
+
 
     # -----------------------------
     # LinkedIn posting
