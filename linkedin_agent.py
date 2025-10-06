@@ -17,7 +17,7 @@ class LinkedInAIAgent:
         self.gemini_api_version = None
         self.gemini_model = None
 
-        # Topics and queries
+        # Topics and queries (rotates across these)
         self.topics = {
             "tech_partnerships": [
                 "technology partnerships business development",
@@ -85,11 +85,12 @@ class LinkedInAIAgent:
         return next_topic, state
 
     def enforce_style_rules(self, text):
+        # No em dashes
         text = text.replace("—", ",").replace("–", ",")
         return text.strip()
 
     # -----------------------------
-    # News fetching
+    # News fetching (Google News RSS)
     # -----------------------------
     def fetch_news(self, topic_key, query):
         rss = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
@@ -101,10 +102,15 @@ class LinkedInAIAgent:
                 return items
 
             content = r.text
-            titles_raw = re.findall(r"<title>(?:<!\[CDATA\[(.*?)\]\]>|(.*?))</title>", content, flags=re.I | re.S)
+            titles_raw = re.findall(
+                r"<title>(?:<!\[CDATA\[(.*?)\]\]>|(.*?))</title>",
+                content,
+                flags=re.I | re.S,
+            )
             titles = [(a or b) for a, b in titles_raw]
             links = re.findall(r"<link>(.*?)</link>", content, flags=re.I | re.S)
 
+            # Skip the feed title
             paired = list(zip(titles[1:], links[1:]))[:6]
             for title, link in paired:
                 if "news.google.com" in link and "url=" in link:
@@ -203,7 +209,6 @@ Requirements:
         body = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.7, "maxOutputTokens": 350},
-            "stopSequences": ["\n\n#"],
         }
 
         def _extract_text(payload):
@@ -305,7 +310,7 @@ Requirements:
             return False
 
     # -----------------------------
-    # Main run
+    # Main run (one post per run)
     # -----------------------------
     def run_weekly_post(self):
         print("\n" + "=" * 60)
