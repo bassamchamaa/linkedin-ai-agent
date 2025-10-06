@@ -13,6 +13,10 @@ class LinkedInAIAgent:
         self.person_urn = os.getenv("LINKEDIN_PERSON_URN", "").strip()
         self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
 
+        # Gemini endpoint cache (set by resolve_gemini_endpoint)
+        self.gemini_api_version = None   # "v1" or "v1beta"
+        self.gemini_model = None         # e.g. "gemini-1.5-flash-latest"
+
         # Topics and queries
         self.topics = {
             "tech_partnerships": [
@@ -32,10 +36,8 @@ class LinkedInAIAgent:
             ],
         }
 
-        # State file to keep rotation across runs
         self.state_file = "agent_state.json"
 
-        # Basic checks
         if not self.linkedin_token or not self.person_urn:
             print("LinkedIn secrets missing. Check LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN.")
         if not self.gemini_key:
@@ -87,12 +89,9 @@ class LinkedInAIAgent:
         return text.strip()
 
     # -----------------------------
-    # News fetching (Google News RSS, no API key)
+    # News fetching (Google News RSS)
     # -----------------------------
     def fetch_news(self, topic_key, query):
-        """
-        Returns a list of dicts: [{"title": str, "link": str}, ...]
-        """
         rss = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
         items = []
         try:
@@ -102,13 +101,11 @@ class LinkedInAIAgent:
                 return items
 
             content = r.text
-
             titles_raw = re.findall(
                 r"<title>(?:<!\[CDATA\[(.*?)\]\]>|(.*?))</title>", content, flags=re.I | re.S
             )
             titles = [(a or b) for a, b in titles_raw]
             links = re.findall(r"<link>(.*?)</link>", content, flags=re.I | re.S)
-
             paired = list(zip(titles[1:], links[1:]))
 
             for title, link in paired[:6]:
@@ -126,12 +123,77 @@ class LinkedInAIAgent:
         return items
 
     # -----------------------------
+    # Gemini endpoint resolution
+    # -----------------------------
+    def resolve_gemini_endpoint(self):
+        """
+        Find a working model + API version for this key by listing models.
+        Caches the result on the instance.
+        """
+        if self.gemini_api_version and self.gemini_model:
+            return
+
+        prefs = [
+            "gemini-1.5-flash-latest",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro-latest",
+            "gemini-1.5-pro",
+            "gemini-pro",
+            "gemini-1.0-pro",
+            "gemini-1.0-pro-latest",
+        ]
+
+        for api_version in ["v1", "v1beta"]:
+            try:
+                url = f"https://generativelanguage.googleapis.com/{api_version}/models?key={self.gemini_key}"
+                r = requests.get(url, timeout=12)
+                if r.status_code != 200:
+                    # Try next version
+                    continue
+                models = r.json().get("models", [])
+                available = {m.get("name", "").split("/")[-1]: m for m in models}
+
+                # Choose preferred available model that supports generateContent if present
+                chosen = None
+                for name in prefs:
+                    m = available.get(name)
+                    if not m:
+                        continue
+                    methods = m.get("supportedGenerationMethods", [])
+                    if not methods or "generateContent" in methods:
+                        chosen = name
+                        break
+
+                # Fallback to any model that includes gemini and supports generateContent
+                if not chosen:
+                    for name, m in available.items():
+                        methods = m.get("supportedGenerationMethods", [])
+                        if "gemini" in name and ("generateContent" in methods or not methods):
+                            chosen = name
+                            break
+
+                if chosen:
+                    self.gemini_api_version = api_version
+                    self.gemini_model = chosen
+                    print(f"Using Gemini model: {chosen} on {api_version}")
+                    return
+            except Exception as e:
+                # Move on to the next version
+                print(f"Model list error on {api_version}: {e}")
+                continue
+
+        # If everything fails, default to v1 + gemini-pro and let the API error guide us
+        self.gemini_api_version = "v1"
+        self.gemini_model = "gemini-pro"
+        print("Falling back to Gemini model: gemini-pro on v1")
+
+    # -----------------------------
     # Gemini generation
     # -----------------------------
     def generate_post_with_gemini(self, topic_key, news_items, include_link):
-        """Generate LinkedIn post using Google Gemini 1.5 Flash"""
-        news_context = "\n".join([f"- {i['title']}: {i['link']}" for i in news_items[:3]])
+        self.resolve_gemini_endpoint()
 
+        news_context = "\n".join([f"- {i['title']}: {i['link']}" for i in news_items[:3]])
         link_instruction = (
             "You MUST include exactly one link to one of the news articles in the body of the post."
             if include_link and any(x.get("link") for x in news_items)
@@ -154,7 +216,7 @@ Requirements:
 - Return only the post text, ready to publish.
 """
 
-        url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent"
+        base = f"https://generativelanguage.googleapis.com/{self.gemini_api_version}/models/{self.gemini_model}:generateContent"
         headers = {"Content-Type": "application/json"}
         body = {
             "contents": [
@@ -167,7 +229,7 @@ Requirements:
         }
 
         try:
-            resp = requests.post(f"{url}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
+            resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
             if resp.status_code != 200:
                 print(f"Gemini error {resp.status_code}: {resp.text[:400]}")
                 return None
@@ -192,9 +254,6 @@ Requirements:
     # LinkedIn posting
     # -----------------------------
     def post_to_linkedin(self, text):
-        """
-        Posts a text-only UGC post to the member's feed.
-        """
         if not self.linkedin_token or not self.person_urn:
             print("Missing LinkedIn token or Person URN. Cannot post.")
             return False
@@ -233,7 +292,7 @@ Requirements:
             return False
 
     # -----------------------------
-    # Main run (one post per run)
+    # Main
     # -----------------------------
     def run_weekly_post(self):
         print("\n" + "=" * 60)
