@@ -14,8 +14,8 @@ class LinkedInAIAgent:
         self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
 
         # Gemini endpoint cache
-        self.gemini_api_version = None  # "v1" or "v1beta"
-        self.gemini_model = None        # e.g., "gemini-1.5-flash-latest"
+        self.gemini_api_version = None
+        self.gemini_model = None
 
         # Topics and queries
         self.topics = {
@@ -85,12 +85,11 @@ class LinkedInAIAgent:
         return next_topic, state
 
     def enforce_style_rules(self, text):
-        # No em dashes
         text = text.replace("—", ",").replace("–", ",")
         return text.strip()
 
     # -----------------------------
-    # News fetching (Google News RSS)
+    # News fetching
     # -----------------------------
     def fetch_news(self, topic_key, query):
         rss = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
@@ -102,15 +101,10 @@ class LinkedInAIAgent:
                 return items
 
             content = r.text
-            titles_raw = re.findall(
-                r"<title>(?:<!\[CDATA\[(.*?)\]\]>|(.*?))</title>",
-                content,
-                flags=re.I | re.S,
-            )
+            titles_raw = re.findall(r"<title>(?:<!\[CDATA\[(.*?)\]\]>|(.*?))</title>", content, flags=re.I | re.S)
             titles = [(a or b) for a, b in titles_raw]
             links = re.findall(r"<link>(.*?)</link>", content, flags=re.I | re.S)
 
-            # Skip the feed title
             paired = list(zip(titles[1:], links[1:]))[:6]
             for title, link in paired:
                 if "news.google.com" in link and "url=" in link:
@@ -134,15 +128,12 @@ class LinkedInAIAgent:
             return
 
         prefs = [
+            "gemini-2.5-flash",
             "gemini-1.5-flash-latest",
             "gemini-1.5-flash",
             "gemini-1.5-pro-latest",
             "gemini-1.5-pro",
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
             "gemini-pro",
-            "gemini-1.0-pro",
-            "gemini-1.0-pro-latest",
         ]
 
         for api_version in ["v1", "v1beta"]:
@@ -164,13 +155,6 @@ class LinkedInAIAgent:
                         chosen = name
                         break
 
-                if not chosen:
-                    for name, m in available.items():
-                        methods = m.get("supportedGenerationMethods", [])
-                        if "gemini" in name and ("generateContent" in methods or not methods):
-                            chosen = name
-                            break
-
                 if chosen:
                     self.gemini_api_version = api_version
                     self.gemini_model = chosen
@@ -188,7 +172,7 @@ class LinkedInAIAgent:
     # Gemini generation
     # -----------------------------
     def generate_post_with_gemini(self, topic_key, news_items, include_link):
-        """Generate the post text using Google Gemini."""
+        """Generate the post text using Google Gemini, robust to response shape changes."""
         self.resolve_gemini_endpoint()
 
         news_context = "\n".join([f"- {i['title']}: {i['link']}" for i in news_items[:3]])
@@ -204,7 +188,7 @@ Recent news and trends:
 {news_context}
 
 Requirements:
-- 150 to 220 words
+- 150 to 200 words
 - Write in the voice of a senior partnerships and revenue leader
 - Focus on partnerships, deal-making, or GTM strategy for tech and fintech
 - {link_instruction}
@@ -217,14 +201,38 @@ Requirements:
         base = f"https://generativelanguage.googleapis.com/{self.gemini_api_version}/models/{self.gemini_model}:generateContent"
         headers = {"Content-Type": "application/json"}
         body = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": prompt}],
-                }
-            ],
-            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 600},
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 350},
+            "stopSequences": ["\n\n#"],
         }
+
+        def _extract_text(payload):
+            try:
+                cand = payload["candidates"][0]
+            except Exception:
+                return None
+
+            content = cand.get("content")
+            if isinstance(content, dict):
+                parts = content.get("parts")
+                if isinstance(parts, list):
+                    texts = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
+                    if any(texts):
+                        return "\n".join(t for t in texts if t)
+            if isinstance(content, list):
+                texts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
+                if any(texts):
+                    return "\n".join(t for t in texts if t)
+            msg = cand.get("message", {})
+            if isinstance(msg, dict):
+                mcontent = msg.get("content")
+                if isinstance(mcontent, list):
+                    texts = [p.get("text", "") for p in mcontent if isinstance(p, dict) and "text" in p]
+                    if any(texts):
+                        return "\n".join(t for t in texts if t)
+            if "text" in cand:
+                return cand["text"]
+            return None
 
         try:
             resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
@@ -233,20 +241,10 @@ Requirements:
                 return None
 
             data = resp.json()
-
-            # Robust extraction across response shapes
-            post = None
-            try:
-                post = data["candidates"][0]["content"]["parts"][0]["text"]
-            except Exception:
-                try:
-                    post = data["candidates"][0]["content"][0]["text"]
-                except Exception:
-                    try:
-                        post = data["candidates"][0]["message"]["content"][0]["text"]
-                    except Exception:
-                        print("Gemini response preview:", json.dumps(data)[:600])
-                        return None
+            post = _extract_text(data)
+            if not post:
+                print("Gemini response preview:", json.dumps(data)[:600])
+                return None
 
             post = self.enforce_style_rules(post)
 
@@ -307,7 +305,7 @@ Requirements:
             return False
 
     # -----------------------------
-    # Main run (one post per run)
+    # Main run
     # -----------------------------
     def run_weekly_post(self):
         print("\n" + "=" * 60)
@@ -319,11 +317,10 @@ Requirements:
             return
 
         topic_key, state = self.get_next_topic(state)
-        include_link = random.random() < 0.60
+        include_link = random.random() < 0.6
         post_type = "with reference link" if include_link else "thought leadership piece"
 
         print(f"--- Topic: {topic_key.replace('_', ' ').title()} ({post_type}) ---")
-
         query = random.choice(self.topics[topic_key])
         print(f"Fetching news for: {query}")
         news_items = self.fetch_news(topic_key, query)
@@ -350,7 +347,7 @@ Requirements:
             self.save_state(state)
             print(f"\n✅ Post #{state['post_count']} published successfully!")
             remaining = 3 - len(state.get("last_topics", []))
-            print(f"Next topics in rotation window: {[t for t in self.topics if t not in state['last_topics']]}")
+            print(f"Next topics: {[t for t in self.topics if t not in state['last_topics']]}")
             print(f"Posts remaining in cycle window: {remaining}")
         else:
             print("\n❌ Failed to publish post")
