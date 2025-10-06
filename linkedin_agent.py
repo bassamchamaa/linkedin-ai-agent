@@ -85,7 +85,7 @@ class LinkedInAIAgent:
         return next_topic, state
 
     def enforce_style_rules(self, text):
-        # No em dashes
+        # No em or en dashes
         text = text.replace("—", ",").replace("–", ",")
         return text.strip()
 
@@ -109,6 +109,7 @@ class LinkedInAIAgent:
             # Skip feed title
             paired = list(zip(titles[1:], links[1:]))[:max_items]
             for title, link in paired:
+                # Unwrap Google redirect
                 if "news.google.com" in link and "url=" in link:
                     m = re.search(r"[?&]url=([^&]+)", link)
                     if m:
@@ -208,7 +209,8 @@ class LinkedInAIAgent:
             title = it["title"]
             if len(title) > 110:
                 title = title[:107] + "..."
-            trimmed.append(f"- {title}{f' | {it['link']}' if it.get('link') else ''}")
+            link_part = f" | {it['link']}" if it.get("link") else ""
+            trimmed.append(f"- {title}{link_part}")
 
         news_context = "\n".join(trimmed)
         link_instruction = (
@@ -268,7 +270,7 @@ class LinkedInAIAgent:
                 data = resp.json()
                 text = self._extract_text_from_gemini(data)
                 if not text:
-                    # Show brief preview for debugging and retry smaller
+                    # Preview for debugging, then retry with smaller prompt
                     print("Gemini response preview:", json.dumps(data)[:600])
                     continue
 
