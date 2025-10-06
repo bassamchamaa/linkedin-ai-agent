@@ -48,9 +48,18 @@ class LinkedInAIAgent:
     def enforce_style_rules(self, text):
         # No em or en dashes, no semicolons
         text = text.replace("—", ",").replace("–", ",").replace(";", ",")
-        # Kill “As a …” openers
+        # Remove generic openers
         text = re.sub(r"^\s*As a [^.!\n]+[, ]+", "", text, flags=re.IGNORECASE)
+        # Trim unmatched opening quote
+        if text.count('"') % 2 == 1 and text.strip().startswith('"'):
+            text = text.lstrip('"').lstrip()
         return text.strip()
+
+    def has_hashtags(self, text):
+        return len(re.findall(r"(?:^|\s)#\w+", text)) >= 2
+
+    def ends_cleanly(self, text):
+        return bool(re.search(r'[.!?]"?\s*$', text))
 
     # -----------------------------
     # State helpers
@@ -97,27 +106,15 @@ class LinkedInAIAgent:
     # URL resolution
     # -----------------------------
     def _extract_original_from_link(self, link):
-        """
-        Google News links can be:
-          - Aggregator with ?url= param
-          - /rss/articles/... that 302s to the publisher
-          - Plain news.google.com
-        We try query param, then follow redirects, else return original.
-        """
         try:
             if not link:
                 return ""
-
             parsed = urlparse(link)
             if "news.google.com" not in parsed.netloc:
-                return link  # already a publisher link
-
-            # If there's a url= param, prefer it
+                return link
             q = parse_qs(parsed.query)
             if "url" in q and q["url"]:
                 return unquote(q["url"][0])
-
-            # Try resolving redirects to publisher
             try:
                 r = requests.get(link, timeout=10, allow_redirects=True, headers={"User-Agent": "curl/8"})
                 final_url = r.url
@@ -125,16 +122,11 @@ class LinkedInAIAgent:
                     return final_url
             except Exception:
                 pass
-
-            return link  # fallback
+            return link
         except Exception:
             return link
 
     def _extract_publisher_from_description(self, description):
-        """
-        Some RSS items embed a publisher link inside <description>.
-        Grab the first http(s) link that is not news.google.com.
-        """
         if not description:
             return ""
         try:
@@ -168,10 +160,8 @@ class LinkedInAIAgent:
                 link = (it.findtext("link") or "").strip()
                 desc = (it.findtext("description") or "").strip()
 
-                # Prefer publisher link from description
-                publisher_link = self._extract_publisher_from_description(desc)
-                best = publisher_link or self._extract_original_from_link(link)
-
+                pub_link = self._extract_publisher_from_description(desc)
+                best = pub_link or self._extract_original_from_link(link)
                 items.append({"title": title, "link": best})
 
                 if len(items) >= max_items:
@@ -188,12 +178,11 @@ class LinkedInAIAgent:
     # -----------------------------
     # Prompt helpers
     # -----------------------------
-    def _build_prompt(self, topic_key, news_items, include_link, keep=2, words_low=120, words_high=160):
+    def _build_prompt(self, topic_key, news_items, include_link, keep=2, words_low=110, words_high=150):
         trimmed = []
         for it in news_items[:keep]:
             title = it["title"][:110] + ("..." if len(it["title"]) > 110 else "")
             link = it.get("link") or ""
-            # Only include specific publisher links in the prompt context
             link_part = f" | {link}" if link and "news.google.com" not in link else ""
             trimmed.append(f"- {title}{link_part}")
 
@@ -208,7 +197,7 @@ class LinkedInAIAgent:
             f"Write a LinkedIn post from a senior sales leader in tech and fintech who favors partnerships. "
             f"Topic: {topic_key.replace('_', ' ')}.\n\n"
             f"Keep it {words_low} to {words_high} words. Be direct, practical, and human. "
-            f"Avoid generic set-ups like 'As a ...'. No em dashes. No semicolons. "
+            f"Avoid generic set ups like 'As a'. No em dashes. No semicolons. "
             f"End with two or three relevant hashtags. "
             f"{link_instruction}\n\n"
             f"Recent items:\n{news_context}\n\n"
@@ -217,7 +206,7 @@ class LinkedInAIAgent:
         return prompt
 
     # -----------------------------
-    # Gemini generation (try known models directly)
+    # Gemini generation
     # -----------------------------
     def _extract_text_from_gemini(self, payload):
         try:
@@ -245,11 +234,9 @@ class LinkedInAIAgent:
             return None
 
         attempts = [
-            {"api": "v1beta", "model": "gemini-1.5-flash-latest", "keep": 2, "max_out": 520, "words": (120, 160)},
+            {"api": "v1beta", "model": "gemini-1.5-flash-latest", "keep": 2, "max_out": 520, "words": (110, 150)},
             {"api": "v1beta", "model": "gemini-1.5-flash",        "keep": 2, "max_out": 480, "words": (110, 150)},
-            {"api": "v1beta", "model": "gemini-1.5-pro-latest",   "keep": 1, "max_out": 480, "words": (110, 150)},
-            {"api": "v1beta", "model": "gemini-1.5-pro",          "keep": 1, "max_out": 440, "words": (100, 140)},
-            {"api": "v1",     "model": "gemini-2.5-flash",        "keep": 1, "max_out": 600, "words": (120, 160)},
+            {"api": "v1",     "model": "gemini-2.5-flash",        "keep": 1, "max_out": 600, "words": (110, 150)},
         ]
 
         headers = {"Content-Type": "application/json"}
@@ -291,22 +278,7 @@ class LinkedInAIAgent:
                     print("Gemini response preview:", json.dumps(data)[:600])
                     continue
 
-                text = self.enforce_style_rules(text)
-
-                # Ensure any included link is a real publisher URL
-                if include_link:
-                    has_link = "http://" in text or "https://" in text
-                    if not has_link:
-                        good = next((it["link"] for it in news_items
-                                     if it.get("link") and "news.google.com" not in it["link"]), "")
-                        if good:
-                            text += f"\n\n{good}"
-                            text = self.enforce_style_rules(text)
-                        else:
-                            # No clean publisher link, switch to thought piece
-                            text = re.sub(r"\nhttps?://\S+$", "", text).strip()
-
-                return text
+                return self.enforce_style_rules(text)
 
             except Exception as e:
                 print(f"Error generating post on attempt {i}: {e}")
@@ -315,7 +287,7 @@ class LinkedInAIAgent:
         return None
 
     # -----------------------------
-    # OpenAI fallback (optional)
+    # OpenAI fallback
     # -----------------------------
     def generate_post_with_openai(self, topic_key, news_items, include_link):
         if not self.openai_key:
@@ -334,8 +306,8 @@ class LinkedInAIAgent:
         prompt = (
             f"Write a LinkedIn post from a senior sales leader in tech and fintech who favors partnerships. "
             f"Topic: {topic_key.replace('_', ' ')}.\n\n"
-            f"Keep it 120 to 160 words. Be direct, practical, and human. "
-            f"Avoid generic set-ups like 'As a ...'. No em dashes. No semicolons. "
+            f"Keep it 110 to 150 words. Be direct, practical, and human. "
+            f"Avoid generic set ups like 'As a'. No em dashes. No semicolons. "
             f"End with two or three relevant hashtags. "
             f"{link_instruction}\n\n"
             f"Recent items:\n{news_context}\n\n"
@@ -343,144 +315,57 @@ class LinkedInAIAgent:
         )
 
         headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-        body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 450}
+        body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 420}
         try:
             r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=45)
             if r.status_code != 200:
                 print(f"OpenAI error {r.status_code}: {r.text[:400]}")
                 return None
             text = r.json()["choices"][0]["message"]["content"]
-            text = self.enforce_style_rules(text)
-
-            if include_link and ("http://" not in text and "https://" not in text):
-                good = next((it["link"] for it in news_items if it.get("link") and "news.google.com" not in it["link"]), "")
-                if good:
-                    text += f"\n\n{good}"
-                    text = self.enforce_style_rules(text)
-            return text
+            return self.enforce_style_rules(text)
         except Exception as e:
             print(f"OpenAI call failed: {e}")
             return None
 
     # -----------------------------
-    # Last-ditch local generator
+    # Local finisher and quality guard
     # -----------------------------
-    def generate_post_locally(self, topic_key, news_items, include_link):
-        bullets = [it["title"] for it in news_items[:2]]
-        hook = "Partnerships deliver when the motion is clear, measurable, and repeatable."
-        insight = (
-            f"Right now I’m seeing faster wins when teams anchor around one customer use case, "
-            f"ship a tight integration, co-sell with the partner, and report the revenue impact in the same dashboard."
-        )
-        close = "Pick a single motion, get proof fast, then scale across your partner ecosystem."
-        link_line = ""
-        if include_link:
-            good = next((it["link"] for it in news_items if it.get("link") and "news.google.com" not in it["link"]), "")
+    def pick_publisher_link(self, news_items):
+        for it in news_items:
+            link = it.get("link") or ""
+            if link and "news.google.com" not in link:
+                return link
+        return ""
+
+    def local_finish(self, partial, include_link, news_items):
+        # Finish cleanly with a short closer and hashtags
+        closer = "The teams that win pick one motion, ship fast, measure impact, then scale."
+        if not self.ends_cleanly(partial):
+            partial = partial.rstrip(' "\n') + "."
+        text = partial + " " + closer
+        if not self.has_hashtags(text):
+            text += "\n\n#partnerships #busdev #fintech"
+        if include_link and ("http://" not in text and "https://" not in text):
+            good = self.pick_publisher_link(news_items)
             if good:
-                link_line = f"\n\n{good}"
-        post = (
-            f"{hook} {insight} {close}\n\n"
-            f"#partnerships #busdev #fintech{link_line}"
-        )
-        return self.enforce_style_rules(post)
+                text += f"\n\n{good}"
+        return self.enforce_style_rules(text)
 
-    # -----------------------------
-    # LinkedIn posting
-    # -----------------------------
-    def post_to_linkedin(self, text):
-        if not self.linkedin_token or not self.person_urn:
-            print("Missing LinkedIn token or Person URN. Cannot post.")
-            return False
+    def post_quality_guard(self, text, include_link, news_items):
+        if not text:
+            return None
 
-        url = "https://api.linkedin.com/v2/ugcPosts"
-        headers = {
-            "Authorization": f"Bearer {self.linkedin_token}",
-            "Content-Type": "application/json",
-            "X-Restli-Protocol-Version": "2.0.0",
-        }
-        payload = {
-            "author": f"urn:li:person:{self.person_urn}",
-            "lifecycleState": "PUBLISHED",
-            "specificContent": {
-                "com.linkedin.ugc.ShareContent": {
-                    "shareCommentary": {"text": text},
-                    "shareMediaCategory": "NONE",
-                }
-            },
-            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
-        }
+        text = self.enforce_style_rules(text)
 
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=45)
-            if r.status_code in (200, 201):
-                print("✓ Successfully posted to LinkedIn")
-                return True
-            print(f"✗ Failed to post: {r.status_code} - {r.text[:400]}")
-            if r.status_code == 401:
-                print("Hint: token expired or missing w_member_social scope.")
-            if r.status_code == 403:
-                print("Hint: app lacks permission to post as a member.")
-            return False
-        except Exception as e:
-            print(f"✗ Error posting to LinkedIn: {e}")
-            return False
+        # Too short or ends mid thought
+        if len(text) < 120 or not self.ends_cleanly(text):
+            return self.local_finish(text, include_link, news_items)
 
-    # -----------------------------
-    # Main run
-    # -----------------------------
-    def run_weekly_post(self):
-        print("\n" + "=" * 60)
-        print(f"LinkedIn AI Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("=" * 60 + "\n")
+        # Missing hashtags
+        if not self.has_hashtags(text):
+            text += "\n\n#partnerships #busdev #fintech"
 
-        state = self.load_state()
-        if not self.should_post_today(state):
-            return
-
-        topic_key, state = self.get_next_topic(state)
-        include_link = random.random() < 0.6
-        post_type = "with publisher link" if include_link else "thought leadership piece"
-
-        print(f"--- Topic: {topic_key.replace('_', ' ').title()} ({post_type}) ---")
-        query = random.choice(self.topics[topic_key])
-        print(f"Fetching news for: {query}")
-        news_items = self.fetch_news(topic_key, query)
-        print(f"Found {len(news_items)} news items")
-
-        # If we decided to include a link but none of the items has a clean publisher link, flip to thought piece
-        if include_link and not any(it.get("link") and "news.google.com" not in it["link"] for it in news_items):
-            include_link = False
-            print("No clean publisher link found, switching to thought leadership.")
-
-        # Generate with Gemini, else OpenAI, else local
-        post_text = None
-        if self.gemini_key:
-            print("Generating post with Gemini...")
-            post_text = self.generate_post_with_gemini(topic_key, news_items, include_link)
-        if not post_text and self.openai_key:
-            print("Gemini failed, using OpenAI...")
-            post_text = self.generate_post_with_openai(topic_key, news_items, include_link)
-        if not post_text:
-            print("All model calls failed, using local template.")
-            post_text = self.generate_post_locally(topic_key, news_items, include_link)
-
-        print("\nGenerated post:\n" + "-" * 60)
-        print(post_text)
-        print("-" * 60)
-
-        ok = self.post_to_linkedin(post_text)
-        if ok:
-            state["post_count"] = state.get("post_count", 0) + 1
-            state["last_post_date"] = datetime.now().strftime("%Y-%m-%d")
-            self.save_state(state)
-            print(f"\n✅ Post #{state['post_count']} published successfully!")
-            remaining = 3 - len(state.get("last_topics", []))
-            print(f"Next topics: {[t for t in self.topics if t not in state['last_topics']]}")
-            print(f"Posts remaining in cycle window: {remaining}")
-        else:
-            print("\n❌ Failed to publish post")
-
-
-if __name__ == "__main__":
-    agent = LinkedInAIAgent()
-    agent.run_weekly_post()
+        # Link handling
+        if include_link and ("http://" not in text and "https://" not in text):
+            good = self.pick_publisher_link(news_items)
+            if good:
