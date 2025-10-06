@@ -1,362 +1,287 @@
 import os
 import json
-import requests
-from datetime import datetime, timedelta
+import re
 import random
+from datetime import datetime
+import requests
+
 
 class LinkedInAIAgent:
     def __init__(self):
-        self.linkedin_token = os.getenv('LINKEDIN_ACCESS_TOKEN')
-        self.openai_key = os.getenv('OPENAI_API_KEY')
-        self.person_urn = os.getenv('LINKEDIN_PERSON_URN')
-        
+        # Secrets
+        self.linkedin_token = os.getenv("LINKEDIN_ACCESS_TOKEN", "").strip()
+        self.person_urn = os.getenv("LINKEDIN_PERSON_URN", "").strip()
+        self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+        # Topics and queries
         self.topics = {
-            'tech_partnerships': [
-                'technology partnerships business development',
-                'B2B tech strategic partnerships',
-                'enterprise technology alliances'
+            "tech_partnerships": [
+                "technology partnerships business development",
+                "B2B tech strategic partnerships",
+                "enterprise technology alliances",
             ],
-            'ai': [
-                'artificial intelligence enterprise',
-                'AI business applications',
-                'machine learning partnerships'
+            "ai": [
+                "artificial intelligence enterprise",
+                "AI business applications",
+                "machine learning partnerships",
             ],
-            'payments': [
-                'fintech payments partnerships',
-                'payment technology trends',
-                'digital payments innovation'
-            ]
+            "payments": [
+                "fintech payments partnerships",
+                "payment technology trends",
+                "digital payments innovation",
+            ],
         }
-        
-        self.state_file = 'agent_state.json'
-    
-    def fetch_news(self, topic, query):
-        """Fetch recent news using Google News RSS (free, no API key needed)"""
-        rss_url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
-        
-        try:
-            response = requests.get(rss_url, timeout=10)
-            if response.status_code == 200:
-                items = []
-                content = response.text
-                
-                import re
-                titles = re.findall(r'<title>(?:<!\[CDATA\[(.*?)\]\]>|(.*?))</title>', content)
-                titles = [t[0] or t[1] for t in titles]
-                links = re.findall(r'<link>(.*?)</link>', content)
 
-                
-                for title, link in zip(titles[1:6], links[1:6]):
-                    items.append({'title': title, 'link': link})
-                
-                return items
-        except Exception as e:
-            print(f"Error fetching news for {topic}: {e}")
-            return []
-    
-    def generate_post_with_gemini(self, topic, news_items, include_link):
-    """Generate LinkedIn post using Google Gemini 1.5 Flash"""
-    news_context = "\n".join([f"- {item['title']}: {item['link']}" for item in news_items[:3]])
+        # State file to keep rotation across runs
+        self.state_file = "agent_state.json"
 
-    link_instruction = "You MUST include a link to one of the news articles in your post." if include_link \
-        else "Do NOT include any links. This should be a thought leadership piece based on current trends."
+        # Basic checks
+        if not self.linkedin_token or not self.person_urn:
+            print("LinkedIn secrets missing. Check LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN.")
+        if not self.gemini_key:
+            print("Gemini key missing. Set GEMINI_API_KEY.")
 
-    prompt = f"""You are a senior sales leader in tech and fintech with deep expertise in strategic partnerships. Create a LinkedIn post about {topic.replace('_', ' ')}.
-
-Recent news/trends:
-{news_context}
-
-Requirements:
-- 150-250 words
-- Write from the perspective of a senior partnerships executive
-- Professional but conversational tone
-- Focus on partnerships, deal-making, or GTM strategy
-- {link_instruction}
-- Include 2-3 relevant hashtags at the end
-- Share a strong POV or actionable insight
-- CRITICAL: Do not use em dashes (—). Use commas, periods, or colons instead.
-
-Return only the post text, ready to publish.
-"""
-
-    api_key = os.getenv('GEMINI_API_KEY')
-    url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent'
-    headers = {'Content-Type': 'application/json'}
-    data = {
-        "contents": [{
-            "role": "user",
-            "parts": [{"text": prompt}]
-        }],
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 600}
-    }
-
-    try:
-        r = requests.post(f"{url}?key={api_key}", headers=headers, json=data, timeout=45)
-        if r.status_code != 200:
-            print(f"Gemini error {r.status_code}: {r.text}")
-            return None
-        result = r.json()
-        post = result["candidates"][0]["content"]["parts"][0]["text"]
-        post = post.replace('—', ',').replace('–', ',')
-        return post
-    except Exception as e:
-        print(f"Error generating post: {e}")
-        return None
-    
-    def generate_post_with_anthropic(self, topic, news_items, include_link):
-        """Generate LinkedIn post using Claude API"""
-        news_context = "\n".join([f"- {item['title']}: {item['link']}" for item in news_items[:3]])
-        
-        link_instruction = ""
-        if include_link:
-            link_instruction = "You MUST include a link to one of the news articles in your post."
-        else:
-            link_instruction = "Do NOT include any links. This should be a thought leadership piece based on current trends."
-        
-        prompt = f"""You are a senior sales leader in tech and fintech with deep expertise in strategic partnerships. Create a LinkedIn post about {topic.replace('_', ' ')}. 
-
-Recent news/trends:
-{news_context}
-
-Requirements:
-- 150-250 words
-- Write from the perspective of a senior partnerships executive
-- Professional but conversational, approachable tone
-- Share strategic insights about partnerships, deal-making, or go-to-market strategies
-- {link_instruction}
-- Include 2-3 relevant hashtags at the end
-- Make it engaging and provide real value
-- Share a strong point of view or actionable insight
-- CRITICAL: Do not use em dashes (—) anywhere in the post. Use commas, periods, or colons instead.
-
-Format: Just return the post text, ready to publish."""
-
-        headers = {
-            'x-api-key': self.openai_key,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json'
-        }
-        
-        data = {
-            'model': 'claude-3-5-sonnet-20241022',
-            'max_tokens': 600,
-            'messages': [{'role': 'user', 'content': prompt}]
-        }
-        
-        try:
-            response = requests.post(
-                'https://api.anthropic.com/v1/messages',
-                headers=headers,
-                json=data,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                post = response.json()['content'][0]['text']
-                post = post.replace('—', ',').replace('–', ',')
-                return post
-        except Exception as e:
-            print(f"Error generating post: {e}")
-        
-        return None
-    
-    def generate_post_with_openai(self, topic, news_items, include_link):
-        """Generate LinkedIn post using OpenAI API"""
-        news_context = "\n".join([f"- {item['title']}: {item['link']}" for item in news_items[:3]])
-        
-        link_instruction = ""
-        if include_link:
-            link_instruction = "You MUST include a link to one of the news articles in your post."
-        else:
-            link_instruction = "Do NOT include any links. This should be a thought leadership piece based on current trends."
-        
-        prompt = f"""You are a senior sales leader in tech and fintech with deep expertise in strategic partnerships. Create a LinkedIn post about {topic.replace('_', ' ')}. 
-
-Recent news/trends:
-{news_context}
-
-Requirements:
-- 150-250 words
-- Write from the perspective of a senior partnerships executive
-- Professional but conversational, approachable tone
-- Share strategic insights about partnerships, deal-making, or go-to-market strategies
-- {link_instruction}
-- Include 2-3 relevant hashtags at the end
-- Make it engaging and provide real value
-- Share a strong point of view or actionable insight
-- CRITICAL: Do not use em dashes (—) anywhere in the post. Use commas, periods, or colons instead.
-
-Format: Just return the post text, ready to publish."""
-
-        headers = {
-            'Authorization': f'Bearer {self.openai_key}',
-            'Content-Type': 'application/json'
-        }
-        
-        data = {
-            'model': 'gpt-4o-mini',
-            'messages': [{'role': 'user', 'content': prompt}],
-            'max_tokens': 600,
-            'temperature': 0.7
-        }
-        
-        try:
-            response = requests.post(
-                'https://api.openai.com/v1/chat/completions',
-                headers=headers,
-                json=data,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                post = response.json()['choices'][0]['message']['content']
-                post = post.replace('—', ',').replace('–', ',')
-                return post
-        except Exception as e:
-            print(f"Error generating post: {e}")
-        
-        return None
-    
-    def post_to_linkedin(self, text):
-        """Post to LinkedIn via API"""
-        url = 'https://api.linkedin.com/v2/ugcPosts'
-        
-        headers = {
-            'Authorization': f'Bearer {self.linkedin_token}',
-            'Content-Type': 'application/json',
-            'X-Restli-Protocol-Version': '2.0.0'
-        }
-        
-        post_data = {
-            'author': f'urn:li:person:{self.person_urn}',
-            'lifecycleState': 'PUBLISHED',
-            'specificContent': {
-                'com.linkedin.ugc.ShareContent': {
-                    'shareCommentary': {
-                        'text': text
-                    },
-                    'shareMediaCategory': 'NONE'
-                }
-            },
-            'visibility': {
-                'com.linkedin.ugc.MemberNetworkVisibility': 'PUBLIC'
-            }
-        }
-        
-        try:
-            response = requests.post(url, headers=headers, json=post_data, timeout=30)
-            
-            if response.status_code in [200, 201]:
-                print(f"✓ Successfully posted to LinkedIn")
-                return True
-            else:
-                print(f"✗ Failed to post: {response.status_code} - {response.text}")
-                return False
-        except Exception as e:
-            print(f"✗ Error posting to LinkedIn: {e}")
-            return False
-    
+    # -----------------------------
+    # Utilities
+    # -----------------------------
     def load_state(self):
-        """Load the agent state to track topic rotation"""
         try:
             if os.path.exists(self.state_file):
-                with open(self.state_file, 'r') as f:
+                with open(self.state_file, "r") as f:
                     return json.load(f)
-        except:
+        except Exception:
             pass
-        return {'last_topics': [], 'post_count': 0, 'last_post_date': None}
-    
+        return {"last_topics": [], "post_count": 0, "last_post_date": None}
+
     def save_state(self, state):
-        """Save the agent state"""
-        with open(self.state_file, 'w') as f:
-            json.dump(state, f)
-    
+        try:
+            with open(self.state_file, "w") as f:
+                json.dump(state, f)
+        except Exception as e:
+            print(f"Could not save state: {e}")
+
     def should_post_today(self, state):
-        """Check if we should post today (only once per day)"""
-        last_post = state.get('last_post_date')
-        today = datetime.now().strftime('%Y-%m-%d')
-        
-        if last_post == today:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if state.get("last_post_date") == today:
             print(f"Already posted today ({today}). Skipping.")
             return False
         return True
-    
+
     def get_next_topic(self, state):
-        """Get the next topic ensuring rotation"""
-        last_topics = state.get('last_topics', [])
-        available_topics = [t for t in self.topics.keys() if t not in last_topics]
-        
-        if not available_topics:
+        last_topics = state.get("last_topics", [])
+        available = [t for t in self.topics if t not in last_topics]
+        if not available:
             last_topics = []
-            available_topics = list(self.topics.keys())
-        
-        next_topic = random.choice(available_topics)
-        
+            available = list(self.topics.keys())
+
+        next_topic = random.choice(available)
         last_topics.append(next_topic)
         if len(last_topics) > 2:
             last_topics = last_topics[-2:]
-        
-        state['last_topics'] = last_topics
+
+        state["last_topics"] = last_topics
         return next_topic, state
-    
+
+    def enforce_style_rules(self, text):
+        text = text.replace("—", ",").replace("–", ",")
+        return text.strip()
+
+    # -----------------------------
+    # News fetching (Google News RSS, no API key)
+    # -----------------------------
+    def fetch_news(self, topic_key, query):
+        """
+        Returns a list of dicts: [{"title": str, "link": str}, ...]
+        """
+        rss = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
+        items = []
+        try:
+            r = requests.get(rss, timeout=12)
+            if r.status_code != 200:
+                print(f"News fetch error {r.status_code} for {topic_key}: {r.text[:200]}")
+                return items
+
+            content = r.text
+
+            titles_raw = re.findall(
+                r"<title>(?:<!\[CDATA\[(.*?)\]\]>|(.*?))</title>", content, flags=re.I | re.S
+            )
+            titles = [(a or b) for a, b in titles_raw]
+            links = re.findall(r"<link>(.*?)</link>", content, flags=re.I | re.S)
+
+            paired = list(zip(titles[1:], links[1:]))
+
+            for title, link in paired[:6]:
+                if "news.google.com" in link and "url=" in link:
+                    m = re.search(r"[?&]url=([^&]+)", link)
+                    if m:
+                        link = requests.utils.unquote(m.group(1))
+                items.append({"title": title.strip(), "link": link.strip()})
+        except Exception as e:
+            print(f"Error fetching news for {topic_key}: {e}")
+
+        if not items:
+            print(f"⚠ No news found for {topic_key}, using fallback.")
+            items = [{"title": f"Current industry trends in {topic_key.replace('_', ' ')}", "link": ""}]
+        return items
+
+    # -----------------------------
+    # Gemini generation
+    # -----------------------------
+    def generate_post_with_gemini(self, topic_key, news_items, include_link):
+        """Generate LinkedIn post using Google Gemini 1.5 Flash"""
+        news_context = "\n".join([f"- {i['title']}: {i['link']}" for i in news_items[:3]])
+
+        link_instruction = (
+            "You MUST include exactly one link to one of the news articles in the body of the post."
+            if include_link and any(x.get("link") for x in news_items)
+            else "Do NOT include any links. This should be a thought leadership piece based on current trends."
+        )
+
+        prompt = f"""You are a senior sales leader in tech and fintech with deep expertise in strategic partnerships. Create a LinkedIn post about {topic_key.replace('_', ' ')}.
+
+Recent news and trends:
+{news_context}
+
+Requirements:
+- 150 to 220 words
+- Write in the voice of a senior partnerships and revenue leader
+- Focus on partnerships, deal-making, or GTM strategy for tech and fintech
+- {link_instruction}
+- Add 2 or 3 relevant hashtags at the end
+- Make it actionable, with a clear point of view
+- Do not use em dashes. Use commas, periods, or colons instead.
+- Return only the post text, ready to publish.
+"""
+
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        headers = {"Content-Type": "application/json"}
+        body = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}],
+                }
+            ],
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 600},
+        }
+
+        try:
+            resp = requests.post(f"{url}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
+            if resp.status_code != 200:
+                print(f"Gemini error {resp.status_code}: {resp.text[:400]}")
+                return None
+            data = resp.json()
+            post = data["candidates"][0]["content"]["parts"][0]["text"]
+            post = self.enforce_style_rules(post)
+
+            if include_link:
+                has_link = "http://" in post or "https://" in post
+                if not has_link:
+                    for it in news_items:
+                        if it.get("link"):
+                            post += f"\n\n{it['link']}"
+                            break
+                    post = self.enforce_style_rules(post)
+            return post
+        except Exception as e:
+            print(f"Error generating post: {e}")
+            return None
+
+    # -----------------------------
+    # LinkedIn posting
+    # -----------------------------
+    def post_to_linkedin(self, text):
+        """
+        Posts a text-only UGC post to the member's feed.
+        """
+        if not self.linkedin_token or not self.person_urn:
+            print("Missing LinkedIn token or Person URN. Cannot post.")
+            return False
+
+        url = "https://api.linkedin.com/v2/ugcPosts"
+        headers = {
+            "Authorization": f"Bearer {self.linkedin_token}",
+            "Content-Type": "application/json",
+            "X-Restli-Protocol-Version": "2.0.0",
+        }
+        payload = {
+            "author": f"urn:li:person:{self.person_urn}",
+            "lifecycleState": "PUBLISHED",
+            "specificContent": {
+                "com.linkedin.ugc.ShareContent": {
+                    "shareCommentary": {"text": text},
+                    "shareMediaCategory": "NONE",
+                }
+            },
+            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+        }
+
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=45)
+            if r.status_code in (200, 201):
+                print("✓ Successfully posted to LinkedIn")
+                return True
+            print(f"✗ Failed to post: {r.status_code} - {r.text[:400]}")
+            if r.status_code == 401:
+                print("Hint: 401 usually means the access token is expired or missing w_member_social scope.")
+            if r.status_code == 403:
+                print("Hint: 403 can mean the app is not approved for member posts or the token lacks permissions.")
+            return False
+        except Exception as e:
+            print(f"✗ Error posting to LinkedIn: {e}")
+            return False
+
+    # -----------------------------
+    # Main run (one post per run)
+    # -----------------------------
     def run_weekly_post(self):
-        """Main function to generate and post once (called 3x per week)"""
-        print(f"\n{'='*60}")
+        print("\n" + "=" * 60)
         print(f"LinkedIn AI Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'='*60}\n")
-        
+        print("=" * 60 + "\n")
+
         state = self.load_state()
-        
         if not self.should_post_today(state):
             return
-        
-        topic_name, state = self.get_next_topic(state)
-        state['post_count'] = state.get('post_count', 0) + 1
-        state['last_post_date'] = datetime.now().strftime('%Y-%m-%d')
-        
-        include_link = random.random() < 0.6
+
+        topic_key, state = self.get_next_topic(state)
+        include_link = random.random() < 0.60
         post_type = "with reference link" if include_link else "thought leadership piece"
-        
-        print(f"--- Topic: {topic_name.replace('_', ' ').title()} ({post_type}) ---\n")
-        
-        query = random.choice(self.topics[topic_name])
+
+        print(f"--- Topic: {topic_key.replace('_', ' ').title()} ({post_type}) ---")
+
+        query = random.choice(self.topics[topic_key])
         print(f"Fetching news for: {query}")
-        news_items = self.fetch_news(topic_name, query)
-        
-        if not news_items:
-            print(f"⚠ No news found for {topic_name}, using fallback...")
-            news_items = [{'title': 'Industry trends in ' + topic_name, 'link': ''}]
-        
+        news_items = self.fetch_news(topic_key, query)
         print(f"Found {len(news_items)} news items")
-        
-        post_text = None
-        if 'GEMINI_API_KEY' in os.environ:
-            print("Generating post with Gemini...")
-            post_text = self.generate_post_with_gemini(topic_name, news_items, include_link)
-        elif 'ANTHROPIC_API_KEY' in os.environ:
-            print("Generating post with Claude...")
-            post_text = self.generate_post_with_anthropic(topic_name, news_items, include_link)
-        elif 'OPENAI_API_KEY' in os.environ:
-            print("Generating post with OpenAI...")
-            post_text = self.generate_post_with_openai(topic_name, news_items, include_link)
-        
-        if not post_text:
-            print(f"⚠ Failed to generate post")
+
+        if not self.gemini_key:
+            print("No Gemini key set, cannot generate content.")
             return
-        
-        print(f"\nGenerated post:\n{'-'*60}\n{post_text}\n{'-'*60}")
-        
-        success = self.post_to_linkedin(post_text)
-        
-        if success:
+
+        print("Generating post with Gemini...")
+        post_text = self.generate_post_with_gemini(topic_key, news_items, include_link)
+        if not post_text:
+            print("⚠ Post generation returned None. See any Gemini error above.")
+            return
+
+        print("\nGenerated post:\n" + "-" * 60)
+        print(post_text)
+        print("-" * 60)
+
+        ok = self.post_to_linkedin(post_text)
+        if ok:
+            state["post_count"] = state.get("post_count", 0) + 1
+            state["last_post_date"] = datetime.now().strftime("%Y-%m-%d")
             self.save_state(state)
             print(f"\n✅ Post #{state['post_count']} published successfully!")
+            remaining = 3 - len(state.get("last_topics", []))
+            print(f"Next topics in rotation window: {[t for t in self.topics if t not in state['last_topics']]}")
+            print(f"Posts remaining in cycle window: {remaining}")
         else:
-            print(f"\n❌ Failed to publish post")
-        
-        print(f"\nNext post will be: {[t for t in self.topics.keys() if t not in state['last_topics']]}")
-        print(f"Posts remaining in cycle: {3 - len(state['last_topics'])}")
+            print("\n❌ Failed to publish post")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     agent = LinkedInAIAgent()
     agent.run_weekly_post()
