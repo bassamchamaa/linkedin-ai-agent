@@ -154,7 +154,7 @@ Requirements:
 - Return only the post text, ready to publish.
 """
 
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
         headers = {"Content-Type": "application/json"}
         body = {
             "contents": [
