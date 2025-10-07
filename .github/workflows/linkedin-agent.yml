@@ -2,29 +2,11 @@ name: LinkedIn AI Agent
 
 on:
   schedule:
-    # Post 3 times per week: Monday, Wednesday, Friday
-    # Key engagement times in ET (converted to UTC: ET + 4/5 hours depending on DST)
-    # Currently set for EDT (ET + 4 hours). Adjust for EST by adding 5 hours.
-    
-    # Early morning engagement (7-9 AM ET = 11 AM-1 PM UTC)
-    - cron: '0 11 * * 1'   # Monday 7 AM ET
-    - cron: '30 11 * * 1'  # Monday 7:30 AM ET
-    - cron: '0 12 * * 1'   # Monday 8 AM ET
-    - cron: '0 13 * * 1'   # Monday 9 AM ET
-    
-    # Lunch hour engagement (12-1 PM ET = 4-5 PM UTC)
-    - cron: '0 16 * * 3'   # Wednesday 12 PM ET
-    - cron: '15 16 * * 3'  # Wednesday 12:15 PM ET
-    - cron: '30 16 * * 3'  # Wednesday 12:30 PM ET
-    - cron: '0 17 * * 3'   # Wednesday 1 PM ET
-    
-    # Friday morning engagement (7-9 AM ET = 11 AM-1 PM UTC)
-    - cron: '0 11 * * 5'   # Friday 7 AM ET
-    - cron: '30 11 * * 5'  # Friday 7:30 AM ET
-    - cron: '0 12 * * 5'   # Friday 8 AM ET
-    - cron: '0 13 * * 5'   # Friday 9 AM ET
-    
-  workflow_dispatch:  # Allows manual trigger
+    # Trigger once per day, script will add random delay
+    - cron: '0 11 * * 1'   # Monday 7 AM ET (start of window)
+    - cron: '0 16 * * 3'   # Wednesday 12 PM ET (start of window)
+    - cron: '0 11 * * 5'   # Friday 7 AM ET (start of window)
+  workflow_dispatch:
 
 jobs:
   post-to-linkedin:
