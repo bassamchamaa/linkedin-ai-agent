@@ -8,13 +8,14 @@ import xml.etree.ElementTree as ET
 import requests
 import time
 
-# Add this function after the imports, before the LinkedInAIAgent class
+
 def random_delay_minutes(min_minutes=0, max_minutes=120):
     """Sleep for a random amount of time within the specified range"""
     delay_seconds = random.randint(min_minutes * 60, max_minutes * 60)
     delay_minutes = delay_seconds / 60
     print(f"Random delay: waiting {delay_minutes:.1f} minutes before posting...")
     time.sleep(delay_seconds)
+
 
 def domain(url: str) -> str:
     try:
@@ -36,7 +37,6 @@ class LinkedInAIAgent:
         self.openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.force_post = os.getenv("FORCE_POST", "").strip() == "1"
 
-        # Topics, now including your new ones
         self.topics = {
             "tech_partnerships": [
                 "technology partnerships business development",
@@ -72,7 +72,6 @@ class LinkedInAIAgent:
             ],
         }
 
-        # Curated, high-impact hashtags in priority order
         self.topic_tags = {
             "tech_partnerships": ["#partnerships", "#busdev", "#GTM", "#SaaS", "#ecosystem"],
             "ai": ["#AI", "#EnterpriseAI", "#B2B", "#GTM", "#ML"],
@@ -88,8 +87,6 @@ class LinkedInAIAgent:
             print("Missing LinkedIn secrets. Set LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN.")
         if not self.gemini_key and not self.openai_key:
             print("No model key found. Set GEMINI_API_KEY or OPENAI_API_KEY.")
-
-    # ---------- Style guards ----------
 
     def enforce_style_rules(self, text: str) -> str:
         text = text.replace("—", ",").replace("–", ",").replace(";", ",")
@@ -114,8 +111,6 @@ class LinkedInAIAgent:
 
     def ends_cleanly(self, text: str) -> bool:
         return bool(re.search(r'[.!?]"?\s*$', text))
-
-    # ---------- State ----------
 
     def load_state(self):
         try:
@@ -155,8 +150,6 @@ class LinkedInAIAgent:
             last_topics = last_topics[-3:]
         state["last_topics"] = last_topics
         return next_topic, state
-
-    # ---------- News and link handling ----------
 
     def _extract_original_from_link(self, link: str) -> str:
         try:
@@ -234,8 +227,6 @@ class LinkedInAIAgent:
                     return l
         return ""
 
-    # ---------- Prompting ----------
-
     def _build_prompt(self, topic_key, news_items, include_link, tone, keep=2, words_low=120, words_high=170) -> str:
         trimmed = []
         for it in news_items[:keep]:
@@ -272,8 +263,6 @@ class LinkedInAIAgent:
             f"Return only the post text."
         )
         return prompt
-
-    # ---------- Models ----------
 
     def _extract_text_from_gemini(self, payload):
         try:
@@ -413,11 +402,8 @@ class LinkedInAIAgent:
             print(f"Polish pass skipped due to error: {e}")
         return self.enforce_style_rules(self.debuzz(text))
 
-    # ---------- Final assembly ----------
-
     def curated_hashtags(self, topic_key: str, body: str) -> str:
         pool = self.topic_tags.get(topic_key, ["#partnerships", "#busdev", "#B2B"])
-        # Keep order of impact, drop any already present as words
         chosen = []
         lower = body.lower()
         for tag in pool:
@@ -426,7 +412,7 @@ class LinkedInAIAgent:
             chosen.append(tag)
             if len(chosen) == 3:
                 break
-        if len(chosen) < 2:  # guarantee at least 2
+        if len(chosen) < 2:
             for tag in ["#B2B", "#GTM", "#AI"]:
                 if tag not in chosen:
                     chosen.append(tag)
@@ -446,37 +432,30 @@ class LinkedInAIAgent:
         return " ".join(clean)
 
     def sanitize_and_finalize(self, body: str, topic_key: str, include_link: bool, news_items):
-        # Remove any hashtag-only lines and inline hashtags from the model
         lines = [ln for ln in body.splitlines() if not re.fullmatch(r'\s*(#\w+\s*){2,}\s*', ln.strip())]
         body = "\n".join(lines)
-        body = re.sub(r'(?<!\w)#\w+', "", body)  # strip inline hashtags
+        body = re.sub(r'(?<!\w)#\w+', "", body)
         body = self.enforce_style_rules(self.debuzz(body)).strip()
 
-        # Truncate anything after a hashtag line if the model slipped one in
         m = re.search(r'(^|\n)\s*(#\w+(?:\s+#\w+){1,})\s*$', body, flags=re.IGNORECASE | re.MULTILINE)
         if m:
             body = body[: m.start()].rstrip()
 
-        # Ensure clean ending and remove duplicates
         body = self.dedupe_sentences(body)
         if not self.ends_cleanly(body):
             body = body.rstrip(' "\n') + "."
 
-        # Add link on its own line if requested and available
         link_line = ""
         if include_link:
             good = self.pick_publisher_link(news_items)
             if good:
                 link_line = f"\n\n{good}"
 
-        # Curated hashtag line last, nothing after it
         tags = self.curated_hashtags(topic_key, body)
         hashtags_line = f"\n\n{tags}" if tags else ""
 
         final_text = body + link_line + hashtags_line
         return self.enforce_style_rules(self.debuzz(final_text)).strip()
-
-    # ---------- LinkedIn ----------
 
     def post_to_linkedin(self, text: str) -> bool:
         if not self.linkedin_token or not self.person_urn:
@@ -516,19 +495,16 @@ class LinkedInAIAgent:
             print(f"LinkedIn error: {e}")
             return False
 
-    # ---------- Runner ----------
-
     def run_weekly_post(self):
-    print("\n" + "=" * 60)
-    print(f"LinkedIn AI Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60 + "\n")
+        print("\n" + "=" * 60)
+        print(f"LinkedIn AI Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 60 + "\n")
 
-    state = self.load_state()
-    if not self.should_post_today(state):
-        return
-    
-    # Add random delay for posting time variety
-    random_delay_minutes(min_minutes=0, max_minutes=120)  # 0-2 hour random delay
+        state = self.load_state()
+        if not self.should_post_today(state):
+            return
+        
+        random_delay_minutes(min_minutes=0, max_minutes=120)
 
         topic_key, state = self.get_next_topic(state)
         include_link = random.random() < 0.6
@@ -544,7 +520,6 @@ class LinkedInAIAgent:
             include_link = False
             print("No clean publisher link found, switching to linkless piece.")
 
-        # Generate body
         post_body = None
         if self.gemini_key:
             print("Generating with Gemini")
@@ -556,7 +531,6 @@ class LinkedInAIAgent:
             print("Models failed, composing locally")
             post_body = self.local_compose(topic_key, include_link, news_items=None)
 
-        # Polish then finalize once to avoid duplicates after hashtags
         post_body = self.polish_with_model(post_body)
         final_text = self.sanitize_and_finalize(post_body, topic_key, include_link, news_items)
 
@@ -570,8 +544,6 @@ class LinkedInAIAgent:
             print(f"Success. Total posts: {state['post_count']}")
         else:
             print("Publish failed")
-
-    # ---------- Local fallback ----------
 
     def local_compose(self, topic_key: str, include_link: bool, news_items):
         hooks = {
