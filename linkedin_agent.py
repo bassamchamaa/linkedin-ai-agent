@@ -6,7 +6,15 @@ from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote
 import xml.etree.ElementTree as ET
 import requests
+import time
 
+# Add this function after the imports, before the LinkedInAIAgent class
+def random_delay_minutes(min_minutes=0, max_minutes=120):
+    """Sleep for a random amount of time within the specified range"""
+    delay_seconds = random.randint(min_minutes * 60, max_minutes * 60)
+    delay_minutes = delay_seconds / 60
+    print(f"Random delay: waiting {delay_minutes:.1f} minutes before posting...")
+    time.sleep(delay_seconds)
 
 def domain(url: str) -> str:
     try:
@@ -511,13 +519,16 @@ class LinkedInAIAgent:
     # ---------- Runner ----------
 
     def run_weekly_post(self):
-        print("\n" + "=" * 60)
-        print(f"LinkedIn AI Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("=" * 60 + "\n")
+    print("\n" + "=" * 60)
+    print(f"LinkedIn AI Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60 + "\n")
 
-        state = self.load_state()
-        if not self.should_post_today(state):
-            return
+    state = self.load_state()
+    if not self.should_post_today(state):
+        return
+    
+    # Add random delay for posting time variety
+    random_delay_minutes(min_minutes=0, max_minutes=120)  # 0-2 hour random delay
 
         topic_key, state = self.get_next_topic(state)
         include_link = random.random() < 0.6
