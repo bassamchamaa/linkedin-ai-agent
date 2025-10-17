@@ -8,9 +8,10 @@ import xml.etree.ElementTree as ET
 import requests
 import time
 
-
+# -------------------------------
+# Utility: randomized post delay
+# -------------------------------
 def random_delay_minutes(min_minutes=0, max_minutes=120):
-    """Sleep for a random amount of time within the specified range"""
     delay_seconds = random.randint(min_minutes * 60, max_minutes * 60)
     delay_minutes = delay_seconds / 60
     print(f"Random delay: waiting {delay_minutes:.1f} minutes before posting...")
@@ -29,6 +30,9 @@ def is_google_news(url: str) -> bool:
     return d.endswith("news.google.com") or d.endswith("google.com")
 
 
+# -------------------------------
+# Main Agent
+# -------------------------------
 class LinkedInAIAgent:
     def __init__(self):
         self.linkedin_token = os.getenv("LINKEDIN_ACCESS_TOKEN", "").strip()
@@ -37,6 +41,7 @@ class LinkedInAIAgent:
         self.openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.force_post = os.getenv("FORCE_POST", "").strip() == "1"
 
+        # ---------- Topics & queries ----------
         self.topics = {
             "tech_partnerships": [
                 "Microsoft strategic partnerships announcements",
@@ -58,7 +63,6 @@ class LinkedInAIAgent:
                 "Tencent enterprise digital workplace",
                 "Samsung enterprise mobility strategy",
             ],
-            
             "ai": [
                 "OpenAI enterprise product announcements",
                 "Anthropic Claude enterprise adoption",
@@ -94,7 +98,6 @@ class LinkedInAIAgent:
                 "Glean AI enterprise search",
                 "Character AI enterprise applications",
             ],
-            
             "payments": [
                 "Stripe strategic partnerships fintech",
                 "Visa payment ecosystem partnerships",
@@ -125,7 +128,6 @@ class LinkedInAIAgent:
                 "Stripe payment infrastructure future",
                 "Visa payment innovation future",
             ],
-            
             "agentic_commerce": [
                 "AI shopping agents ecommerce launch",
                 "autonomous commerce platform enterprise",
@@ -144,7 +146,6 @@ class LinkedInAIAgent:
                 "autonomous checkout future",
                 "AI commerce orchestration future",
             ],
-            
             "generative_ai": [
                 "OpenAI GPT enterprise launch",
                 "Anthropic Claude business release",
@@ -171,7 +172,6 @@ class LinkedInAIAgent:
                 "AI copilots workplace transformation",
                 "generative AI business model innovation",
             ],
-            
             "ai_automations": [
                 "AI workflow automation enterprise launch",
                 "intelligent process automation enterprise",
@@ -196,15 +196,38 @@ class LinkedInAIAgent:
             ],
         }
 
+        # Curated hashtag pools per topic (we'll blend these with extracted keywords)
         self.topic_tags = {
-            "tech_partnerships": ["#partnerships", "#busdev", "#GTM", "#SaaS", "#ecosystem"],
+            "tech_partnerships": ["#Partnerships", "#Ecosystem", "#GTM", "#B2B", "#SaaS"],
             "ai": ["#AI", "#EnterpriseAI", "#B2B", "#GTM", "#ML"],
-            "payments": ["#fintech", "#payments", "#B2B", "#partnerships", "#risk"],
-            "agentic_commerce": ["#agenticAI", "#ecommerce", "#CX", "#conversion"],
-            "generative_ai": ["#GenerativeAI", "#LLM", "#EnterpriseAI", "#product"],
-            "ai_automations": ["#automation", "#AIagents", "#ops", "#productivity"],
+            "payments": ["#Fintech", "#Payments", "#EmbeddedFinance", "#Risk", "#B2B"],
+            "agentic_commerce": ["#AgenticAI", "#Ecommerce", "#CX", "#Conversion"],
+            "generative_ai": ["#GenerativeAI", "#LLMs", "#EnterpriseAI", "#Product"],
+            "ai_automations": ["#Automation", "#AIAgents", "#Ops", "#Productivity"],
         }
 
+        # Style modes + openers/closers banks to rotate
+        self.style_modes = ["story", "tactical", "contrarian", "data_point", "playbook"]
+
+        self.openers = [
+            "The fastest wins in enterprise come from reducing time to value.",
+            "Great partnerships feel simple to customers because the hard work is invisible.",
+            "When teams share one metric, decisions speed up.",
+            "Execution beats theater. Especially in B2B.",
+            "The best AI outcomes start with clear owners and clean data.",
+            "Partnerships work when the field asks for them, not when slides announce them.",
+        ]
+
+        self.closers = [
+            "Pick a single metric, align the incentives, and publish progress weekly.",
+            "Start small, prove value, then scale the playbook with the right partners.",
+            "Make it measurable, repeatable, and boring—in the best way.",
+            "One win at a time, instrumented end to end.",
+            "Shift meetings into dashboards and let the results speak.",
+            "Choose partners that shorten the path to customer value.",
+        ]
+
+        # State & memory
         self.state_file = "agent_state.json"
 
         if not self.linkedin_token or not self.person_urn:
@@ -212,15 +235,26 @@ class LinkedInAIAgent:
         if not self.gemini_key and not self.openai_key:
             print("No model key found. Set GEMINI_API_KEY or OPENAI_API_KEY.")
 
+    # -------------------------------
+    # Style & sanitation helpers
+    # -------------------------------
     def enforce_style_rules(self, text: str) -> str:
+        if not text:
+            return text
         text = text.replace("—", ",").replace("–", ",").replace(";", ",")
+        # Remove "As a ..." opener
         text = re.sub(r"^\s*As a [^.!\n]+[, ]+", "", text, flags=re.IGNORECASE)
+        # Strip stray opening quote if unmatched
         if text.count('"') % 2 == 1 and text.strip().startswith('"'):
             text = text.lstrip('"').lstrip()
+        # Collapse whitespace
         text = re.sub(r"[ \t]{2,}", " ", text)
+        # Avoid double hashtags line inside body
         return text.strip()
 
     def debuzz(self, text: str) -> str:
+        if not text:
+            return text
         replacements = {
             r"\bsynergy\b": "fit",
             r"\bleverage\b": "use",
@@ -236,6 +270,12 @@ class LinkedInAIAgent:
     def ends_cleanly(self, text: str) -> bool:
         return bool(re.search(r'[.!?]"?\s*$', text))
 
+    def word_count(self, text: str) -> int:
+        return len(re.findall(r"\b\w+\b", text or ""))
+
+    # -------------------------------
+    # Persistence
+    # -------------------------------
     def load_state(self):
         try:
             if os.path.exists(self.state_file):
@@ -243,7 +283,14 @@ class LinkedInAIAgent:
                     return json.load(f)
         except Exception:
             pass
-        return {"last_topics": [], "post_count": 0, "last_post_date": None}
+        # Also track hashtag/closing recency
+        return {
+            "last_topics": [],
+            "post_count": 0,
+            "last_post_date": None,
+            "recent_hashtag_sets": [],
+            "recent_closers": [],
+        }
 
     def save_state(self, state):
         try:
@@ -275,6 +322,9 @@ class LinkedInAIAgent:
         state["last_topics"] = last_topics
         return next_topic, state
 
+    # -------------------------------
+    # News helpers
+    # -------------------------------
     def _extract_original_from_link(self, link: str) -> str:
         try:
             if not link:
@@ -351,40 +401,57 @@ class LinkedInAIAgent:
                     return l
         return ""
 
-    def _build_prompt(self, topic_key, news_items, include_link, tone, keep=2, words_low=120, words_high=170) -> str:
+    # -------------------------------
+    # Prompting & generation
+    # -------------------------------
+    def _build_prompt(self, topic_key, news_items, include_link, tone, style, keep=2) -> str:
+        # Trimmed news context
         trimmed = []
         for it in news_items[:keep]:
-            t = it["title"]
-            title = t[:110] + ("..." if len(t) > 110 else "")
+            t = (it["title"] or "").strip()
+            title = t[:140] + ("..." if len(t) > 140 else "")
             link = it.get("link") or ""
             link_part = f" | {link}" if link and not is_google_news(link) else ""
             trimmed.append(f"- {title}{link_part}")
-
         news_context = "\n".join(trimmed)
+
         link_instruction = (
-            "Include exactly one publisher link on its own line before the hashtags."
+            "Include exactly one publisher link on its own line before the hashtags. Do not link to news.google.com."
             if include_link and any(x.get("link") and not is_google_news(x["link"]) for x in news_items)
             else "Do not include any links."
         )
 
-        persona = (
-            "Write like a senior sales leader in tech and fintech who favors partnerships. "
-            "Direct, grounded, and human. Confident, not cocky."
-        )
+        persona = "Write like a senior tech/fintech sales leader who favors partnerships—direct, grounded, helpful."
+        if style == "story":
+            structure = (
+                "Structure: 1) short scene/opening, 2) what changed, 3) concrete lesson for partnerships/gtm, "
+                "4) one-line CTA or challenge."
+            )
+        elif style == "tactical":
+            structure = "Structure: 1) problem, 2) 3 bullet-style tactics in prose, 3) expected outcome, 4) CTA."
+        elif style == "contrarian":
+            structure = "Structure: 1) common belief, 2) why it fails, 3) better pattern, 4) example, 5) CTA."
+        elif style == "data_point":
+            structure = "Structure: 1) single metric or observation, 2) what it implies, 3) one play to run, 4) CTA."
+        else:
+            structure = "Structure: 1) context, 2) simple playbook steps, 3) risk to avoid, 4) CTA."
+
         tone_line = (
-            "Tone: inspirational, clear call to action."
+            "Tone: inspirational with restraint, never chest-beating."
             if tone == "inspirational"
-            else "Tone: thought leadership with one strong point of view and one actionable takeaway."
+            else "Tone: thought leadership, specific and useful."
         )
 
         prompt = (
-            f"{persona} {tone_line} Topic: {topic_key.replace('_', ' ')}.\n\n"
-            f"Keep it {words_low} to {words_high} words. Avoid buzzwords. No generic openers like 'As a'. "
-            f"No em dashes. No semicolons. Vary sentence length. "
-            f"End with two or three relevant hashtags on a separate last line. "
-            f"{link_instruction}\n\n"
-            f"Recent items:\n{news_context}\n\n"
-            f"Return only the post text."
+            f"{persona} {tone_line} Topic: {topic_key.replace('_', ' ')}. {structure}\n\n"
+            "Requirements:\n"
+            "- 150 to 220 words (hard limit). Vary sentence length and rhythm.\n"
+            "- Avoid buzzwords. No generic openers like 'As a'. No em dashes. No semicolons.\n"
+            "- Use a clean, confident, human voice. Keep it practical.\n"
+            "- End with exactly 3 relevant hashtags on a final separate line.\n"
+            f"- {link_instruction}\n\n"
+            f"Recent items to anchor context:\n{news_context}\n\n"
+            "Return only the post text."
         )
         return prompt
 
@@ -408,22 +475,19 @@ class LinkedInAIAgent:
             return cand["text"]
         return None
 
-    def generate_post_with_gemini(self, topic_key, news_items, include_link, tone):
+    def generate_post_with_gemini(self, topic_key, news_items, include_link, tone, style):
         if not self.gemini_key:
             return None
 
         attempts = [
-            {"api": "v1beta", "model": "gemini-1.5-flash-latest", "keep": 2, "max_out": 520, "words": (130, 180)},
-            {"api": "v1",     "model": "gemini-2.5-flash",        "keep": 1, "max_out": 600, "words": (130, 180)},
+            {"api": "v1", "model": "gemini-2.5-flash", "keep": 2, "max_out": 600},
+            {"api": "v1beta", "model": "gemini-1.5-flash-latest", "keep": 2, "max_out": 560},
         ]
         headers = {"Content-Type": "application/json"}
 
         for i, step in enumerate(attempts, start=1):
             base = f"https://generativelanguage.googleapis.com/{step['api']}/models/{step['model']}:generateContent"
-            prompt = self._build_prompt(
-                topic_key, news_items, include_link, tone,
-                keep=step["keep"], words_low=step["words"][0], words_high=step["words"][1]
-            )
+            prompt = self._build_prompt(topic_key, news_items, include_link, tone, style, keep=step["keep"])
             body = {
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0.7, "maxOutputTokens": step["max_out"]},
@@ -455,34 +519,44 @@ class LinkedInAIAgent:
                 continue
         return None
 
-    def generate_post_with_openai(self, topic_key, news_items, include_link, tone):
+    def generate_post_with_openai(self, topic_key, news_items, include_link, tone, style):
         if not self.openai_key:
             return None
 
         news_context = "\n".join(
-            f"- {it['title'][:110]}{'...' if len(it['title'])>110 else ''}"
+            f"- {it['title'][:140]}{'...' if len(it['title'])>140 else ''}"
             f"{' | ' + it['link'] if it.get('link') and not is_google_news(it['link']) else ''}"
             for it in news_items[:2]
         )
         link_instruction = (
-            "Include exactly one publisher link on its own line before the hashtags."
+            "Include exactly one publisher link on its own line before the hashtags. Do not link to news.google.com."
             if include_link and any(x.get("link") and not is_google_news(x["link"]) for x in news_items)
             else "Do not include any links."
         )
         tone_line = "inspirational" if tone == "inspirational" else "thought leadership"
+
+        structures = {
+            "story": "1) opening scene, 2) change, 3) lesson, 4) CTA",
+            "tactical": "1) problem, 2) 3 tactics in prose, 3) outcome, 4) CTA",
+            "contrarian": "1) common belief, 2) why it fails, 3) better pattern, 4) example, 5) CTA",
+            "data_point": "1) metric/observation, 2) implication, 3) play to run, 4) CTA",
+            "playbook": "1) context, 2) steps, 3) risk to avoid, 4) CTA",
+        }
+
         prompt = (
-            "Write a LinkedIn post from a senior sales leader in tech and fintech who favors partnerships. "
-            f"Tone: {tone_line}. Topic: {topic_key.replace('_', ' ')}.\n\n"
-            "Keep it 130 to 180 words. Direct, practical, and human. "
-            "Avoid buzzwords and generic openers. No em dashes. No semicolons. "
-            "End with two or three relevant hashtags on a separate last line. "
-            f"{link_instruction}\n\n"
+            "Write a LinkedIn post from a senior sales leader in tech/fintech who favors partnerships. "
+            f"Tone: {tone_line}. Topic: {topic_key.replace('_', ' ')}. Structure: {structures.get(style, 'playbook')}.\n\n"
+            "Requirements:\n"
+            "- 150 to 220 words. Vary sentence length and rhythm.\n"
+            "- Direct, practical, human. Avoid buzzwords. No generic openers. No em dashes. No semicolons.\n"
+            "- End with exactly 3 relevant hashtags on the last line.\n"
+            f"- {link_instruction}\n\n"
             f"Recent items:\n{news_context}\n\n"
             "Return only the post text."
         )
 
         headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-        body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.65, "max_tokens": 440}
+        body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 520}
         try:
             r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=45)
             if r.status_code != 200:
@@ -494,14 +568,48 @@ class LinkedInAIAgent:
             print(f"OpenAI call failed: {e}")
             return None
 
+    # -------------------------------
+    # Refinement passes
+    # -------------------------------
+    def expand_if_short(self, text: str, min_words=150, target_high=200):
+        if not text or self.word_count(text) >= min_words:
+            return text
+        prompt = (
+            "Expand and refine the LinkedIn post to approximately "
+            f"{min_words}-{target_high} words. Keep the same ideas, facts, and any URL. "
+            "Improve flow and add 1 crisp example or detail. Avoid hype. "
+            "No em dashes. No semicolons. End with the existing hashtags line if present; "
+            "if not present, do not add hashtags.\n\nPost:\n" + text
+        )
+        try:
+            if self.gemini_key:
+                url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
+                body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 360}}
+                r = requests.post(f"{url}?key={self.gemini_key}", headers={"Content-Type": "application/json"}, json=body, timeout=35)
+                if r.status_code == 200:
+                    expanded = self._extract_text_from_gemini(r.json())
+                    if expanded:
+                        return self.enforce_style_rules(self.debuzz(expanded))
+            if self.openai_key:
+                headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
+                body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 360}
+                r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=35)
+                if r.status_code == 200:
+                    expanded = r.json()["choices"][0]["message"]["content"]
+                    if expanded:
+                        return self.enforce_style_rules(self.debuzz(expanded))
+        except Exception:
+            pass
+        return text
+
     def polish_with_model(self, text: str):
         if not text:
             return text
         prompt = (
             "Edit the LinkedIn post to improve grammar, flow, and clarity. "
-            "Keep the same ideas and facts. Do not add or remove URLs. "
-            "Remove any hashtags you see. Keep a neutral, senior voice. "
-            "No em dashes. No semicolons. Return only the edited text.\n\n"
+            "Keep the same ideas and any URL. Remove any hashtags you see. "
+            "Neutral, senior voice. No em dashes. No semicolons. Return only the edited text.\n\n"
             f"Post:\n{text}"
         )
         try:
@@ -526,23 +634,83 @@ class LinkedInAIAgent:
             print(f"Polish pass skipped due to error: {e}")
         return self.enforce_style_rules(self.debuzz(text))
 
-    def curated_hashtags(self, topic_key: str, body: str) -> str:
-        pool = self.topic_tags.get(topic_key, ["#partnerships", "#busdev", "#B2B"])
-        chosen = []
-        lower = body.lower()
-        for tag in pool:
-            if tag.lower() in lower:
+    # -------------------------------
+    # Hashtags & finalization
+    # -------------------------------
+    STOPWORDS = {
+        "the","and","for","with","that","this","from","into","over","after","about","your","their","there",
+        "of","a","to","in","on","at","as","by","is","are","was","be","it","its","an","or","we","our","you","they",
+        "ai","llm","llms","via","vs","using","how","why","what","new","latest","future","today","more"
+    }
+
+    def _keywords_from_titles(self, news_items, k=6):
+        text = " ".join((it.get("title") or "") for it in news_items[:4])
+        words = re.findall(r"[A-Za-z][A-Za-z0-9\-]+", text)
+        freq = {}
+        for w in words:
+            wl = w.lower()
+            if wl in self.STOPWORDS or len(wl) < 4:
                 continue
-            chosen.append(tag)
-            if len(chosen) == 3:
+            freq[wl] = freq.get(wl, 0) + 1
+        # Top k keywords
+        keys = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:k]
+        # CamelCase a bit
+        def camel(t): return re.sub(r"[^A-Za-z0-9]", "", t.title())
+        return [camel(t[0]) for t in keys if t[0]]
+
+    def curated_hashtags(self, topic_key: str, body: str, news_items, state) -> str:
+        base = self.topic_tags.get(topic_key, ["#B2B", "#GTM"])
+        dynamic = ["#" + k for k in self._keywords_from_titles(news_items, k=6) if k]
+        pool = list(dict.fromkeys(base + dynamic))  # unique, keep order
+
+        # Avoid duplicates already present in body
+        lower = body.lower()
+        candidates = [t for t in pool if t.lower() not in lower]
+
+        # Choose 3 but avoid recent repeats
+        recent_sets = state.get("recent_hashtag_sets", [])
+        random.shuffle(candidates)
+        chosen = None
+        for i in range(min(12, len(candidates))):
+            trial = " ".join(candidates[i:i+3]) if len(candidates[i:i+3]) >= 3 else None
+            if trial and trial.lower() not in recent_sets:
+                chosen = trial
                 break
-        if len(chosen) < 2:
-            for tag in ["#B2B", "#GTM", "#AI"]:
-                if tag not in chosen:
-                    chosen.append(tag)
-                if len(chosen) == 3:
-                    break
-        return " ".join(chosen[:3])
+        if not chosen:
+            chosen = " ".join((pool[:3] or ["#B2B", "#GTM", "#AI"]))
+
+        # Update memory
+        recent_sets.append(chosen.lower())
+        state["recent_hashtag_sets"] = recent_sets[-10:]
+        return chosen
+
+    def inject_open_close(self, body: str, state) -> str:
+        # Rotate opener
+        op = random.choice(self.openers)
+        # Rotate closer avoiding recent repeats
+        recent_closers = state.get("recent_closers", [])
+        random.shuffle(self.closers)
+        closer = None
+        for c in self.closers:
+            if c.lower() not in recent_closers:
+                closer = c
+                break
+        closer = closer or random.choice(self.closers)
+
+        # Update memory
+        recent_closers.append(closer.lower())
+        state["recent_closers"] = recent_closers[-10:]
+
+        # If body already has a strong first sentence, keep it and prepend a short clause
+        body = body.strip()
+        first = re.split(r'\n|\.\s+', body, maxsplit=1)[0]
+        if len(first) < 12 or len(first) > 160:
+            new_body = f"{op} {body}"
+        else:
+            new_body = f"{op} {body}"
+
+        # Add closer before hashtags/link (we’ll reassemble later)
+        return new_body, closer
 
     def dedupe_sentences(self, text: str) -> str:
         parts = re.split(r'(?<=[.!?])\s+', text.strip())
@@ -555,32 +723,52 @@ class LinkedInAIAgent:
                 clean.append(s.strip())
         return " ".join(clean)
 
-    def sanitize_and_finalize(self, body: str, topic_key: str, include_link: bool, news_items):
+    def sanitize_and_finalize(self, body: str, topic_key: str, include_link: bool, news_items, state):
+        # Remove any hashtag lines mixed into body
         lines = [ln for ln in body.splitlines() if not re.fullmatch(r'\s*(#\w+\s*){2,}\s*', ln.strip())]
         body = "\n".join(lines)
+        # Strip stray hashtags inline
         body = re.sub(r'(?<!\w)#\w+', "", body)
         body = self.enforce_style_rules(self.debuzz(body)).strip()
 
+        # Remove trailing hashtags line if model appended one
         m = re.search(r'(^|\n)\s*(#\w+(?:\s+#\w+){1,})\s*$', body, flags=re.IGNORECASE | re.MULTILINE)
         if m:
             body = body[: m.start()].rstrip()
 
+        # Expansion if short
+        body = self.expand_if_short(body, min_words=150, target_high=210)
+
+        # De-dupe and ensure clean end
         body = self.dedupe_sentences(body)
         if not self.ends_cleanly(body):
             body = body.rstrip(' "\n') + "."
 
+        # Inject opener and closer (then reattach link/hashtags)
+        body, closer = self.inject_open_close(body, state)
+        if not self.ends_cleanly(body):
+            body += " "
+        body += closer
+        if not self.ends_cleanly(body):
+            body += "."
+
+        # Link (one publisher link on its own line)
         link_line = ""
         if include_link:
             good = self.pick_publisher_link(news_items)
             if good:
                 link_line = f"\n\n{good}"
 
-        tags = self.curated_hashtags(topic_key, body)
+        # Hashtags (dynamic + curated, avoid recent)
+        tags = self.curated_hashtags(topic_key, body, news_items, state)
         hashtags_line = f"\n\n{tags}" if tags else ""
 
         final_text = body + link_line + hashtags_line
         return self.enforce_style_rules(self.debuzz(final_text)).strip()
 
+    # -------------------------------
+    # LinkedIn posting
+    # -------------------------------
     def post_to_linkedin(self, text: str) -> bool:
         if not self.linkedin_token or not self.person_urn:
             print("Missing LinkedIn token or Person URN. Cannot post.")
@@ -619,6 +807,28 @@ class LinkedInAIAgent:
             print(f"LinkedIn error: {e}")
             return False
 
+    # -------------------------------
+    # Local compose fallback
+    # -------------------------------
+    def local_compose(self, topic_key: str):
+        hooks = {
+            "tech_partnerships": "Partnerships work when both teams invest real resources and chase one metric together.",
+            "ai": "AI wins in the enterprise when it reduces time to value, not just cost.",
+            "payments": "Payments is a trust business. Speed and acceptance matter, proof beats promises.",
+            "agentic_commerce": "Agentic commerce turns browsing into doing. The best agents remove steps, not just clicks.",
+            "generative_ai": "Generative AI helps when it is paired with data quality and strong guardrails.",
+            "ai_automations": "Automation shines when it owns the boring work and hands off the tough parts clearly.",
+        }
+        hook = hooks.get(topic_key, "Clarity beats noise.")
+        insight = (
+            "Start with one use case, instrument outcomes, share the numbers weekly, "
+            "and scale the playbook with partners once the pattern repeats."
+        )
+        return self.enforce_style_rules(self.debuzz(f"{hook} {insight}"))
+
+    # -------------------------------
+    # Main run
+    # -------------------------------
     def run_weekly_post(self):
         print("\n" + "=" * 60)
         print(f"LinkedIn AI Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -627,14 +837,16 @@ class LinkedInAIAgent:
         state = self.load_state()
         if not self.should_post_today(state):
             return
-        
+
+        # Randomize time in window
         random_delay_minutes(min_minutes=0, max_minutes=120)
 
         topic_key, state = self.get_next_topic(state)
         include_link = random.random() < 0.6
         tone = random.choice(["inspirational", "thought_leadership"])
+        style = random.choice(self.style_modes)
 
-        print(f"Topic: {topic_key} | tone: {tone} | link: {include_link}")
+        print(f"Topic: {topic_key} | tone: {tone} | style: {style} | link: {include_link}")
         query = random.choice(self.topics[topic_key])
         print(f"Fetching news for: {query}")
         news_items = self.fetch_news(topic_key, query)
@@ -647,16 +859,17 @@ class LinkedInAIAgent:
         post_body = None
         if self.gemini_key:
             print("Generating with Gemini")
-            post_body = self.generate_post_with_gemini(topic_key, news_items, include_link, tone)
+            post_body = self.generate_post_with_gemini(topic_key, news_items, include_link, tone, style)
         if not post_body and self.openai_key:
             print("Fallback to OpenAI")
-            post_body = self.generate_post_with_openai(topic_key, news_items, include_link, tone)
+            post_body = self.generate_post_with_openai(topic_key, news_items, include_link, tone, style)
         if not post_body:
             print("Models failed, composing locally")
-            post_body = self.local_compose(topic_key, include_link, news_items=None)
+            post_body = self.local_compose(topic_key)
 
+        # Polish + expand if short
         post_body = self.polish_with_model(post_body)
-        final_text = self.sanitize_and_finalize(post_body, topic_key, include_link, news_items)
+        final_text = self.sanitize_and_finalize(post_body, topic_key, include_link, news_items, state)
 
         print("\nGenerated post\n" + "-" * 60 + f"\n{final_text}\n" + "-" * 60)
 
@@ -668,19 +881,6 @@ class LinkedInAIAgent:
             print(f"Success. Total posts: {state['post_count']}")
         else:
             print("Publish failed")
-
-    def local_compose(self, topic_key: str, include_link: bool, news_items):
-        hooks = {
-            "tech_partnerships": "Partnerships work when both teams invest real resources and chase one metric together.",
-            "ai": "AI wins in the enterprise when it reduces time to value, not just cost.",
-            "payments": "Payments is a trust business. Speed and acceptance matter, proof beats promises.",
-            "agentic_commerce": "Agentic commerce turns browsing into doing. The best agents remove steps, not just clicks.",
-            "generative_ai": "Generative AI helps when it is paired with data quality and strong guardrails.",
-            "ai_automations": "Automation shines when it owns the boring work and hands off the tough parts clearly.",
-        }
-        hook = hooks.get(topic_key, "Clarity beats noise.")
-        insight = "Start with one use case, instrument outcomes, share the numbers weekly, then scale the playbook with partners."
-        return self.enforce_style_rules(self.debuzz(f"{hook} {insight}"))
 
 
 if __name__ == "__main__":
