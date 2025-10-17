@@ -526,8 +526,8 @@ class LinkedInAIAgent:
             return None
 
         attempts = [
-            {"api": "v1", "model": "gemini-2.5-flash", "keep": 2, "max_out": 600},
-            {"api": "v1beta", "model": "gemini-1.5-flash-latest", "keep": 2, "max_out": 560},
+            {"api": "v1", "model": "gemini-2.5-flash", "keep": 2, "max_out": 1200},
+            {"api": "v1beta", "model": "gemini-1.5-flash-latest", "keep": 2, "max_out": 1200},
         ]
         headers = {"Content-Type": "application/json"}
 
