@@ -20,7 +20,9 @@ def log(msg: str) -> None:
 
 log("BOOT linkedin_agent.py — starting import")
 
-# ----- helpers -----
+# -------------------------------
+# Utility helpers
+# -------------------------------
 def random_delay_minutes(min_minutes: int = 0, max_minutes: int = 120) -> None:
     if os.getenv("SKIP_DELAY") == "1" or os.getenv("DISABLE_DELAY") == "1":
         log("Delay disabled (SKIP_DELAY/DISABLE_DELAY set) — skipping randomized wait.")
@@ -45,15 +47,18 @@ INSIGHT_VARIATIONS = [
 ]
 
 class LinkedInAIAgent:
+    # Hashtag stopwords + brand bans
     STOPWORDS = {"the","and","for","with","that","this","from","into","over","after","about","your","their","there",
                  "of","a","to","in","on","at","as","by","is","are","was","be","it","its","an","or","we","our","you",
                  "they","ai","llm","llms","via","vs","using","how","why","what","new","latest","future","today","more"}
     BANNED_BRAND_TAGS = {"#paypal", "#visa", "#mastercard", "#stripe", "#adyen"}
 
+    # Length controls (BODY only; hashtags excluded)
     MIN_WORDS = 150
     MAX_WORDS = 210
     TARGET_HIGH = 190
 
+    # For safety against instruction/meta leaks
     META_RED_FLAGS = [
         "STRICT OUTPUT RULES","Return ONLY the post","Do not add headings","You wrote",
         "short by","over the limit","responseMimeType","maxOutputTokens"
@@ -69,6 +74,7 @@ class LinkedInAIAgent:
         def mask(s): return f"{len(s)} chars" if s else "MISSING"
         log(f"ENV: LINKEDIN_ACCESS_TOKEN={mask(self.linkedin_token)} | PERSON_URN={mask(self.person_urn)} | GEMINI_KEY={mask(self.gemini_key)} | OPENAI_KEY={mask(self.openai_key)} | FORCE_POST={self.force_post}")
 
+        # ---------- Topics & queries ----------
         self.topics: Dict[str, List[str]] = {
             "tech_partnerships": [
                 "Microsoft strategic partnerships announcements","Oracle enterprise alliance deals",
@@ -154,6 +160,7 @@ class LinkedInAIAgent:
             ],
         }
 
+        # Curated hashtag pools per topic
         self.topic_tags: Dict[str, List[str]] = {
             "tech_partnerships": ["#Partnerships", "#Ecosystem", "#GTM", "#B2B", "#SaaS"],
             "ai": ["#AI", "#EnterpriseAI", "#B2B", "#GTM", "#ML"],
@@ -163,6 +170,7 @@ class LinkedInAIAgent:
             "ai_automations": ["#Automation", "#AIAgents", "#Ops", "#Productivity"],
         }
 
+        # Style modes + openers/closers
         self.style_modes = ["story","tactical","contrarian","data_point","playbook"]
         self.openers = [
             "The fastest wins in enterprise come from reducing time to value.",
@@ -187,7 +195,9 @@ class LinkedInAIAgent:
         if not self.gemini_key and not self.openai_key:
             log("WARNING: No model key found. Set GEMINI_API_KEY or OPENAI_API_KEY.")
 
-    # ----- style -----
+    # -------------------------------
+    # Style helpers
+    # -------------------------------
     def enforce_style_rules(self, text: str) -> str:
         if not text: return text
         text = text.replace("—", ",").replace("–", ",").replace(";", ",")
@@ -218,7 +228,9 @@ class LinkedInAIAgent:
     def word_count(self, text: str) -> int:
         return len(re.findall(r"\b\w+\b", text or ""))
 
-    # ----- state -----
+    # -------------------------------
+    # State
+    # -------------------------------
     def load_state(self) -> dict:
         try:
             if os.path.exists(self.state_file):
@@ -253,7 +265,9 @@ class LinkedInAIAgent:
         state["last_topics"] = last_topics
         return next_topic, state
 
-    # ----- news -----
+    # -------------------------------
+    # News
+    # -------------------------------
     def _extract_original_from_link(self, link: str) -> str:
         try:
             if not link: return ""
@@ -324,7 +338,9 @@ class LinkedInAIAgent:
                 continue
         return ""
 
-    # ----- prompting -----
+    # -------------------------------
+    # Prompting
+    # -------------------------------
     def _build_prompt(self, topic_key: str, news_items: List[dict], include_link: bool,
                       tone: str, style: str, keep: int = 3) -> str:
         trimmed = []
@@ -366,10 +382,8 @@ class LinkedInAIAgent:
 
     def _extract_text_from_gemini(self, payload: dict) -> Optional[str]:
         try:
-            # safety feedback logging
             pf = payload.get("promptFeedback")
-            if pf:
-                log(f"Gemini promptFeedback: {json.dumps(pf)[:200]}")
+            if pf: log(f"Gemini promptFeedback: {json.dumps(pf)[:200]}")
             cands = payload.get("candidates", [])
             if not cands:
                 log("Gemini: no candidates returned")
@@ -393,10 +407,13 @@ class LinkedInAIAgent:
             return None
 
     def _strip_hashtags_anywhere(self, text: str) -> str:
+        # remove hashtag-only lines
         lines = [ln for ln in text.splitlines() if not re.fullmatch(r'\s*(#\w+\s*){2,}\s*', ln.strip())]
         text = "\n".join(lines)
+        # remove inline variants
         text = re.sub(r'\bhashtag#\w+\b', "", text, flags=re.IGNORECASE)
         text = re.sub(r'(?<!\w)#\w+', "", text)
+        # normalize spaces
         return re.sub(r'\s{2,}', ' ', text).strip()
 
     def generate_post_with_gemini(self, topic_key, news_items, include_link, tone, style) -> Optional[str]:
@@ -421,7 +438,7 @@ class LinkedInAIAgent:
         last_clean: Optional[str] = None
         for i, cap in enumerate([900, 1100, 1300], start=1):
             log(f"Gemini bounded attempt {i} (maxTokens={cap})")
-            raw = call(base_prompt if i == 1 else base_prompt, cap)
+            raw = call(base_prompt, cap)
             if not raw:
                 continue
             clean = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(raw)))
@@ -430,7 +447,6 @@ class LinkedInAIAgent:
             last_clean = clean
             if self.MIN_WORDS <= wc <= self.MAX_WORDS:
                 return clean
-            # ask model once to adjust
             if i < 3:
                 delta_prompt = (
                     f"You wrote {wc} words. Revise to {self.MIN_WORDS}-{self.MAX_WORDS} words. "
@@ -439,7 +455,6 @@ class LinkedInAIAgent:
                 )
                 base_prompt = clean + "\n\n" + delta_prompt
 
-        # If we have something, we’ll expand locally
         if last_clean:
             boosted = self.expand_body_if_short(last_clean)
             boosted = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(boosted)))
@@ -447,19 +462,18 @@ class LinkedInAIAgent:
                 return boosted
         return last_clean
 
+    # (OpenAI path omitted in your env)
     def generate_post_with_openai(self, *args, **kwargs) -> Optional[str]:
-        # Not used in your env run (OPENAI_KEY missing), but keep for completeness
-        key = self.openai_key
-        if not key: return None
-        # (Omitted here for brevity; same as prior build)
         return None
 
-    # ----- expansion (now truly guaranteed) -----
+    # -------------------------------
+    # Expansion (guaranteed)
+    # -------------------------------
     def expand_body_if_short(self, body: str) -> str:
         if not body or self.word_count(body) >= self.MIN_WORDS:
             return body
 
-        # Try model light-touch expand
+        # Light model expand attempt
         try:
             if self.gemini_key:
                 prompt = (
@@ -495,16 +509,16 @@ class LinkedInAIAgent:
         i = 0
         while self.word_count(body) < self.MIN_WORDS:
             if not self.ends_cleanly(body): body = body.rstrip() + "."
-            addon = pads[i % len(pads)]
-            body += addon
+            body += pads[i % len(pads)]
             i += 1
-            # final safety if somehow still short
             if i > 50:
                 body += " Add one more concrete checkpoint and report it next week."
                 break
         return body
 
-    # ----- hashtags & assembly -----
+    # -------------------------------
+    # Hashtags & assembly
+    # -------------------------------
     def _keywords_from_titles(self, news_items: List[dict], k: int = 6) -> List[str]:
         text = " ".join((it.get("title") or "") for it in news_items[:4])
         words = re.findall(r"[A-Za-z][A-Za-z0-9\-]+", text)
@@ -576,16 +590,38 @@ class LinkedInAIAgent:
             text = re.sub(p, "", text, flags=re.IGNORECASE | re.DOTALL)
         return re.sub(r"\s{2,}", " ", text).strip()
 
+    def normalize_hashtags_block(self, text: str, tags_line: str) -> str:
+        """
+        Remove ANY hashtag-only lines anywhere in the text, then append exactly one clean block at the end.
+        """
+        lines = text.splitlines()
+        kept = []
+        for ln in lines:
+            if re.fullmatch(r'\s*(#\w+\s*){2,}\s*', ln.strip()):
+                continue  # drop hashtag blocks inside body
+            kept.append(ln)
+        base = "\n".join([l for l in kept]).rstrip()
+        if not base.endswith("\n\n"):
+            if not base.endswith("\n"):
+                base += "\n"
+            base += "\n"
+        return base + tags_line.strip()
+
     def assemble_post(self, raw_body: str, topic_key: str, include_link: bool,
                       news_items: List[dict], state: dict) -> str:
+        # 1) clean body
         body = self._strip_hashtags_anywhere(raw_body)
         body = self.enforce_style_rules(self.debuzz(body)).strip()
         body = self.dedupe_sentences(body)
         if not self.ends_cleanly(body): body = body.rstrip(' "\n') + "."
+
+        # 2) opener/closer
         body, closer = self.inject_open_close(body, state)
         if not self.ends_cleanly(body): body += " "
         body += closer
         if not self.ends_cleanly(body): body += "."
+
+        # 3) link (no hashtags yet)
         link_line = ""
         if include_link:
             good = self.pick_publisher_link(news_items)
@@ -593,12 +629,24 @@ class LinkedInAIAgent:
             elif os.getenv("ABORT_IF_NO_LINK") == "1":
                 raise RuntimeError("ABORT_IF_NO_LINK=1 and no deep link found.")
         body_plus_link = body + link_line
+
+        # 4) expand to MIN_WORDS (may reintroduce hashtags!)
         expanded = self.expand_body_if_short(body_plus_link)
-        tags = self.curated_hashtags(topic_key, expanded, news_items, state)
-        final_text = expanded + (f"\n\n{tags}" if tags else "")
+
+        # 5) STRIP hashtags again AFTER expansion to avoid leaks
+        expanded = self._strip_hashtags_anywhere(expanded)
+        expanded = self.enforce_style_rules(self.debuzz(expanded)).strip()
+
+        # 6) tags & normalize: always force a clean final block
+        tags_line = self.curated_hashtags(topic_key, expanded, news_items, state)
+        tags_line = " ".join(tags_line.split())  # squeeze spaces
+        final_text = self.normalize_hashtags_block(expanded, tags_line)
+
         return self.enforce_style_rules(self.debuzz(final_text)).strip()
 
-    # ----- QC -----
+    # -------------------------------
+    # Quality Gate
+    # -------------------------------
     def has_meta_leakage(self, text: str) -> bool:
         t = text or ""
         return any(flag.lower() in t.lower() for flag in self.META_RED_FLAGS)
@@ -608,24 +656,30 @@ class LinkedInAIAgent:
         if self.has_meta_leakage(text): return False, "meta/instructions leakage detected"
 
         lines = [l for l in text.splitlines() if l.strip()]
-        hashtags_line = ""
-        if lines and re.fullmatch(r"(#\w+\s*){3}", lines[-1].strip()):
-            hashtags_line = lines[-1]
-        elif lines and re.fullmatch(r"(#\w+\s*){2,}", lines[-1].strip()):
-            return False, "hashtags count not equal to 3 on last line"
+        # Must have a final hashtags line of exactly 3 tags
+        if not lines:
+            return False, "empty"
+        last = lines[-1].strip()
+        if not re.fullmatch(r"(#\w+\s*){3}", last):
+            if re.search(r"#\w+", text):
+                return False, "hashtags not at end as single line"
+            return False, "missing final hashtags line"
 
-        body_only = text if not hashtags_line else text[: text.rfind(hashtags_line)].rstrip()
+        # Body-only checks
+        body_only = text[: text.rfind(last)].rstrip()
         wc = self.word_count(body_only)
         if wc < self.MIN_WORDS: return False, f"too short ({wc} words)"
         if wc > self.MAX_WORDS: return False, f"too long ({wc} words)"
         if len(re.findall(r"[.!?]", body_only)) < 3: return False, "too few sentences"
-        if "#" in text and not hashtags_line: return False, "hashtags not at end as single line"
         if include_link and "news.google.com" in text: return False, "google news link present"
+        # No hashtag-only lines inside body
         for ln in lines[:-1]:
-            if re.fullmatch(r"(#\w+\s*){2,}", ln): return False, "inline hashtag block found"
+            if re.fullmatch(r"(#\w+\s*){2,}", ln.strip()): return False, "inline hashtag block found"
         return True, "ok"
 
-    # ----- post -----
+    # -------------------------------
+    # Posting
+    # -------------------------------
     def post_to_linkedin(self, text: str) -> bool:
         if not self.linkedin_token or not self.person_urn:
             log("Missing LinkedIn token or Person URN. Cannot post.")
@@ -651,7 +705,9 @@ class LinkedInAIAgent:
         except Exception as e:
             log(f"LinkedIn error: {e}"); return False
 
-    # ----- local compose -----
+    # -------------------------------
+    # Local compose
+    # -------------------------------
     def local_compose(self, topic_key: str) -> str:
         hooks = {
             "tech_partnerships":"Partnerships work when both teams invest real resources and chase one metric together.",
@@ -665,7 +721,9 @@ class LinkedInAIAgent:
         insight = random.choice(INSIGHT_VARIATIONS)
         return self.enforce_style_rules(self.debuzz(f"{hook} {insight}"))
 
-    # ----- main -----
+    # -------------------------------
+    # Main
+    # -------------------------------
     def run_weekly_post(self) -> None:
         log("=" * 60)
         log(f"LinkedIn AI Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
