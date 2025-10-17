@@ -10,6 +10,7 @@ What this version fixes:
 - Smarter Gemini handling: retries when finishReason=MAX_TOKENS with bigger maxOutputTokens.
 - If REQUIRE_LINK=1, retries news fetch once with an alternate query to find a deep publisher link.
 - Final pad-to-min if still short (adds one crisp sentence), then quality gate.
+- NEW: PYMNTS.com scraper. Set NEWS_SOURCE=pymnts to prefer PYMNTS globally; it is also auto-used for the 'payments' topic.
 """
 
 import os
@@ -22,6 +23,7 @@ import xml.etree.ElementTree as ET
 import requests
 import time
 from typing import Tuple, List, Dict
+from html import unescape  # NEW
 
 # -------------------------------
 # Configuration
@@ -70,6 +72,26 @@ INSIGHT_VARIATIONS = [
 ]
 
 
+# --------------------------------
+# HTML meta extractor (for PYMNTS)
+# --------------------------------
+def _extract_meta(html: str, name: str) -> str:
+    """Pulls <meta property/name=... content=...> or falls back to <title> for og/twitter title."""
+    patterns = [
+        rf'<meta[^>]+property=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']',
+        rf'<meta[^>]+name=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, flags=re.IGNORECASE)
+        if m:
+            return unescape(m.group(1)).strip()
+    if name in ("og:title", "twitter:title"):
+        m = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            return unescape(re.sub(r"\s+", " ", m.group(1))).strip()
+    return ""
+
+
 # -------------------------------
 # Main Agent
 # -------------------------------
@@ -90,6 +112,7 @@ class LinkedInAIAgent:
         self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
         self.openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.force_post = os.getenv("FORCE_POST", "").strip() == "1"
+        self.news_source = os.getenv("NEWS_SOURCE", "").strip().lower()  # NEW
 
         # ---------- Topics & queries ----------
         self.topics: Dict[str, List[str]] = {
@@ -405,8 +428,77 @@ class LinkedInAIAgent:
         return next_topic, state
 
     # -------------------------------
-    # News helpers
+    # News helpers (PYMNTS + RSS)
     # -------------------------------
+    def fetch_pymnts_news(self, query: str = "", max_items: int = 6) -> List[dict]:
+        """
+        Scrape recent articles from https://www.pymnts.com/.
+        - Scans homepage and a few sections.
+        - Filters to pymnts.com links with dated paths or /news/.
+        - Scores titles by presence of query terms.
+        """
+        headers = {"User-Agent": "curl/8"}
+        pages = [
+            "https://www.pymnts.com/",
+            "https://www.pymnts.com/category/news/",
+            "https://www.pymnts.com/category/payments/",
+            "https://www.pymnts.com/category/b2b/",
+        ]
+        seen: List[str] = []
+        items: List[dict] = []
+
+        def good_url(u: str) -> bool:
+            if not u.startswith("http"):
+                return False
+            if "pymnts.com" not in domain(u):
+                return False
+            path = urlparse(u).path
+            if re.search(r"/\d{4}/\d{2}/\d{2}/", path):  # dated article URL
+                return True
+            return "/news/" in path
+
+        # collect candidate URLs
+        for url in pages:
+            try:
+                r = requests.get(url, headers=headers, timeout=12)
+                if r.status_code != 200:
+                    continue
+                for href in re.findall(r'href=["\'](https?://[^"\']+)["\']', r.text, flags=re.IGNORECASE):
+                    if good_url(href) and href not in seen:
+                        seen.append(href)
+            except Exception:
+                continue
+            if len(seen) > max_items * 4:
+                break
+
+        # fetch titles and score
+        q_terms = [w.lower() for w in re.findall(r"[A-Za-z0-9]+", query)] if query else []
+        scored: List[tuple] = []
+        for href in seen[: max_items * 6]:
+            try:
+                rr = requests.get(href, headers=headers, timeout=10)
+                if rr.status_code != 200:
+                    continue
+                title = _extract_meta(rr.text, "og:title") or _extract_meta(rr.text, "twitter:title")
+                if not title:
+                    continue
+                score = 0
+                tl = title.lower()
+                for t in q_terms:
+                    if t and t in tl:
+                        score += 1
+                scored.append((score, title.strip(), href))
+            except Exception:
+                continue
+
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        for _, title, href in scored[:max_items]:
+            items.append({"title": title, "link": href})
+
+        if not items:
+            items = [{"title": "Latest PYMNTS coverage on payments and B2B", "link": ""}]
+        return items
+
     def _extract_original_from_link(self, link: str) -> str:
         try:
             if not link:
@@ -441,6 +533,14 @@ class LinkedInAIAgent:
         return ""
 
     def fetch_news(self, topic_key: str, query: str, max_items: int = 6) -> List[dict]:
+        # Prefer PYMNTS if globally requested, or automatically for the payments topic
+        use_pymnts = (self.news_source == "pymnts") or (topic_key == "payments")
+        if use_pymnts:
+            items = self.fetch_pymnts_news(query=query, max_items=max_items)
+            if items:
+                return items
+
+        # Fallback: Google News RSS
         rss = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
         items: List[dict] = []
         try:
