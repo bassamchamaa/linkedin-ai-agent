@@ -13,8 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15       # Hard cap for the whole job
     env:
-      DISABLE_DELAY: "1"      # Make sure we never sleep in CI
-      FORCE_POST: "1"         # Optional: bypass once-per-day guard if you use it
+      SKIP_DELAY: "1"         # <-- rename from DISABLE_DELAY to SKIP_DELAY
+      FORCE_POST: "1"         # Optional: bypass once-per-day guard
+      # REQUIRE_LINK: "1"     # Optional: uncomment to require a deep publisher link
 
     steps:
       - name: Checkout code
@@ -38,7 +39,7 @@ jobs:
           OPENAI_API_KEY:        ${{ secrets.OPENAI_API_KEY }}  # optional
         run: |
           # Extra protection so the python step can't hang forever
-          timeout 10m python linkedin_agent.py
+          timeout 10m python -u linkedin_agent.py
 
       - name: Commit state file
         if: always()
