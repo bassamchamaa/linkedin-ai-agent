@@ -15,7 +15,7 @@ def gen(model):
     url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={API_KEY}"
     body = {
         "contents":[{"role":"user","parts":[{"text":"Give one concrete, non-hype tip for B2B partnerships (2 sentences)."}]}],
-        "generationConfig":{"maxOutputTokens": 240, "temperature": 0.6}
+        "generationConfig":{"maxOutputTokens": 1200, "temperature": 0.6}
     }
     r = requests.post(url, json=body, timeout=30, headers={"Content-Type": "application/json"})
     print("Status:", r.status_code)
