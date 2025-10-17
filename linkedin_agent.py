@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-LinkedIn AI Agent — quality-focused version (100–150 words)
+LinkedIn AI Agent — quality-focused version
 
 Key improvements:
-- Reliable Gemini generation (tries 1.5-flash-8b first, then 2.5-flash with smart retry).
 - Punctuation & spacing normalization.
 - Removes "As a ..." openers and buzzwords.
-- Avoids boilerplate “start with one use case…” endings.
+- Stops repeating the "Start with one use case..." playbook.
 - Picks only relevant hashtags (no brand tags unless mentioned).
 - Forces deep publisher links (no Google News); otherwise posts linkless.
-- Quality gate (length band, sentence count, hashtag placement, link checks).
-- Delay skip via SKIP_DELAY=1 or DISABLE_DELAY=1 for CI/manual runs.
-- REQUIRE_LINK=1 prefers posts with a publisher link when available.
+- Quality gate (length, sentence count, hashtag placement, link checks).
+- Optional delay skip via SKIP_DELAY=1 or DISABLE_DELAY=1 for CI/manual runs.
+- Optional REQUIRE_LINK=1 to prefer posts with a publisher link when available.
+- Final expansion pass guarantees MIN_WORDS length even on local fallback.
 """
 
 import os
@@ -30,7 +30,7 @@ from typing import Tuple, List, Dict
 # Utility: randomized post delay
 # -------------------------------
 def random_delay_minutes(min_minutes: int = 0, max_minutes: int = 120) -> None:
-    """Sleep for a random amount of time within the specified range unless SKIP_DELAY=1 or DISABLE_DELAY=1."""
+    """Sleep for a random amount of time within the specified range unless SKIP_DELAY/DISABLE_DELAY is set."""
     if os.getenv("SKIP_DELAY") == "1" or os.getenv("DISABLE_DELAY") == "1":
         print("Delay disabled (SKIP_DELAY/DISABLE_DELAY set) — skipping randomized wait.")
         return
@@ -56,10 +56,10 @@ def is_google_news(url: str) -> bool:
 # Constants for style/variation
 # --------------------------------
 INSIGHT_VARIATIONS = [
-    "Make the metric visible to both teams and review it weekly. Public scoreboards change behavior.",
-    "Reduce the first value moment. Shorter time-to-value beats feature depth when budgets are tight.",
-    "Instrument the handoffs. Most friction hides between systems, not within them.",
-    "Prove the pattern in one segment, then clone it with the same playbook and safeguards.",
+    "Pick one use case, instrument it, and publish real numbers weekly.",
+    "Anchor on one measurable outcome and review progress in the open.",
+    "Make the play repeatable: same metric, same cadence, broader surface.",
+    "Ship something small, measure honestly, scale what actually works.",
 ]
 
 
@@ -76,6 +76,10 @@ class LinkedInAIAgent:
         "future", "today", "more"
     }
     BANNED_BRAND_TAGS = {"#paypal", "#visa", "#mastercard", "#stripe", "#adyen"}
+
+    # Length controls
+    MIN_WORDS = 150       # desired floor
+    TARGET_HIGH = 190     # soft upper target for expansion
 
     def __init__(self) -> None:
         self.linkedin_token = os.getenv("LINKEDIN_ACCESS_TOKEN", "").strip()
@@ -400,6 +404,7 @@ class LinkedInAIAgent:
         if not description:
             return ""
         try:
+            # Prefer any non-Google href in the RSS description
             urls = re.findall(r'href="(https?://[^"]+)"', description)
             for u in urls:
                 if not is_google_news(u):
@@ -443,14 +448,30 @@ class LinkedInAIAgent:
         return items
 
     def pick_publisher_link(self, news_items: List[dict]) -> str:
-        """Return a deep publisher link (no Google News, must have a real path)."""
+        """Return a deep publisher link by resolving redirects if needed (no Google News, must have real path)."""
         for it in news_items:
-            l = (it.get("link") or "").strip()
-            if not l or is_google_news(l):
+            raw = (it.get("link") or "").strip()
+            if not raw:
                 continue
-            parsed = urlparse(l)
-            if parsed.scheme.startswith("http") and parsed.netloc and parsed.path and parsed.path != "/":
-                return l
+            # If it's already a direct publisher link with a path, accept it
+            if not is_google_news(raw):
+                parsed = urlparse(raw)
+                if parsed.scheme.startswith("http") and parsed.netloc and parsed.path and parsed.path != "/":
+                    return raw
+            # Otherwise resolve Google redirect via HEAD, then GET as fallback
+            try:
+                h = {"User-Agent": "curl/8"}
+                r = requests.head(raw, allow_redirects=True, timeout=10, headers=h)
+                final_url = r.url
+                if is_google_news(final_url):
+                    r = requests.get(raw, allow_redirects=True, timeout=12, headers=h)
+                    final_url = r.url
+                if final_url and not is_google_news(final_url):
+                    p = urlparse(final_url)
+                    if p.scheme.startswith("http") and p.netloc and p.path and p.path != "/":
+                        return final_url
+            except Exception:
+                continue
         return ""
 
     # -------------------------------
@@ -491,7 +512,7 @@ class LinkedInAIAgent:
         prompt = (
             f"{persona} {tone_line} Topic: {topic_key.replace('_', ' ')}. {structure}\n\n"
             "Requirements:\n"
-            "- 100 to 150 words (hard limit). Vary sentence length and rhythm.\n"
+            "- 150 to 220 words (hard limit). Vary sentence length and rhythm.\n"
             "- Avoid buzzwords. No generic openers like 'As a'. No em dashes. No semicolons.\n"
             "- Use a clean, confident, human voice. Keep it practical.\n"
             "- End with exactly 3 relevant hashtags on a final separate line.\n"
@@ -526,10 +547,9 @@ class LinkedInAIAgent:
         if not self.gemini_key:
             return None
 
-        # Try a lighter model first; then 2.5-flash with larger output & retry if MAX_TOKENS
         attempts = [
-            {"api": "v1", "model": "gemini-1.5-flash-8b", "keep": 2, "max_out": 520},
-            {"api": "v1", "model": "gemini-2.5-flash",     "keep": 2, "max_out": 1200},
+            {"api": "v1", "model": "gemini-2.5-flash", "keep": 3, "max_out": 1200},
+            {"api": "v1", "model": "gemini-2.0-flash", "keep": 3, "max_out": 900},
         ]
         headers = {"Content-Type": "application/json"}
 
@@ -549,25 +569,18 @@ class LinkedInAIAgent:
                 if resp.status_code != 200:
                     print(f"Gemini error {resp.status_code} on attempt {i}: {resp.text[:600]}")
                     continue
-
                 data = resp.json()
                 text = self._extract_text_from_gemini(data)
                 if not text:
-                    fr = data.get("candidates", [{}])[0].get("finishReason")
-                    ttc = data.get("usageMetadata", {}).get("thoughtsTokenCount", 0)
-                    if fr == "MAX_TOKENS":
-                        # One-time retry with enlarged token cap to leave headroom after "thinking"
-                        bigger = max(step["max_out"], ttc + 300, 1200)
-                        body["generationConfig"]["maxOutputTokens"] = bigger
-                        print(f"Retrying {step['model']} with maxOutputTokens={bigger} (thinking={ttc})")
-                        resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
-                        if resp.status_code == 200:
-                            text = self._extract_text_from_gemini(resp.json())
-                            if text:
-                                return self.enforce_style_rules(self.debuzz(text))
-                    # Otherwise continue to next attempt
+                    fr = None
+                    try:
+                        fr = data["candidates"][0].get("finishReason")
+                    except Exception:
+                        pass
+                    if fr:
+                        print(f"Finish reason: {fr}")
+                    print("Gemini response preview:", json.dumps(data)[:600])
                     continue
-
                 return self.enforce_style_rules(self.debuzz(text))
             except Exception as e:
                 print(f"Error generating post on attempt {i}: {e}")
@@ -602,7 +615,7 @@ class LinkedInAIAgent:
             "Write a LinkedIn post from a senior sales leader in tech/fintech who favors partnerships. "
             f"Tone: {tone_line}. Topic: {topic_key.replace('_', ' ')}. Structure: {structures.get(style, 'playbook')}.\n\n"
             "Requirements:\n"
-            "- 100 to 150 words. Vary sentence length and rhythm.\n"
+            "- 150 to 220 words. Vary sentence length and rhythm.\n"
             "- Direct, practical, human. Avoid buzzwords. No generic openers. No em dashes. No semicolons.\n"
             "- End with exactly 3 relevant hashtags on the last line.\n"
             f"- {link_instruction}\n\n"
@@ -627,22 +640,22 @@ class LinkedInAIAgent:
     # -------------------------------
     # Refinement passes
     # -------------------------------
-    def expand_if_short(self, text: str, min_words: int = 100, target_high: int = 150) -> str:
-        """If text shorter than min_words, expand to the 100–150 band without adding hashtags."""
-        if not text or self.word_count(text) >= min_words:
+    def expand_if_short(self, text: str) -> str:
+        """If text shorter than MIN_WORDS, expand toward TARGET_HIGH without adding hashtags."""
+        if not text or self.word_count(text) >= self.MIN_WORDS:
             return text
         prompt = (
             "Expand and refine the LinkedIn post to approximately "
-            f"{min_words}-{target_high} words. Keep the same ideas, facts, and any URL. "
+            f"{self.MIN_WORDS}-{self.TARGET_HIGH} words. Keep the same ideas, facts, and any URL. "
             "Add one concrete example or small detail. Avoid hype. "
             "No em dashes. No semicolons. End with the existing hashtags line if present; "
             "if not present, do not add hashtags.\n\nPost:\n" + text
         )
         try:
             if self.gemini_key:
-                url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-8b:generateContent"
+                url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
                 body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 360}}
+                        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 480}}
                 r = requests.post(f"{url}?key={self.gemini_key}", headers={"Content-Type": "application/json"},
                                   json=body, timeout=35)
                 if r.status_code == 200:
@@ -652,7 +665,7 @@ class LinkedInAIAgent:
             if self.openai_key:
                 headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
                 body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.3, "max_tokens": 360}
+                        "temperature": 0.3, "max_tokens": 480}
                 r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
                                   json=body, timeout=35)
                 if r.status_code == 200:
@@ -674,7 +687,7 @@ class LinkedInAIAgent:
         )
         try:
             if self.gemini_key:
-                url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-8b:generateContent"
+                url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
                 body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
                         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 320}}
                 r = requests.post(f"{url}?key={self.gemini_key}", headers={"Content-Type": "application/json"},
@@ -817,10 +830,7 @@ class LinkedInAIAgent:
         if m:
             body = body[: m.start()].rstrip()
 
-        # Expansion if short (target 100–150)
-        body = self.expand_if_short(body, min_words=100, target_high=150)
-
-        # De-dupe and ensure clean end
+        # De-dupe and ensure clean end before open/close
         body = self.dedupe_sentences(body)
         if not self.ends_cleanly(body):
             body = body.rstrip(' "\n') + "."
@@ -844,7 +854,12 @@ class LinkedInAIAgent:
         tags = self.curated_hashtags(topic_key, body, news_items, state)
         hashtags_line = f"\n\n{tags}" if tags else ""
 
+        # Assemble
         final_text = body + link_line + hashtags_line
+
+        # FINAL length enforcement: expand if still short
+        final_text = self.expand_if_short(final_text)
+
         return self.enforce_style_rules(self.debuzz(final_text)).strip()
 
     def quality_gate(self, text: str, include_link: bool) -> Tuple[bool, str]:
@@ -852,9 +867,9 @@ class LinkedInAIAgent:
         if not text:
             return False, "empty"
         wc = self.word_count(text)
-        if wc < 95:
+        if wc < self.MIN_WORDS:
             return False, f"too short ({wc} words)"
-        if wc > 170:
+        if wc > 210:
             return False, f"too long ({wc} words)"
         if len(re.findall(r"[.!?]", text)) < 3:
             return False, "too few sentences"
@@ -912,59 +927,20 @@ class LinkedInAIAgent:
             return False
 
     # -------------------------------
-    # Local compose fallback (110–140 words)
+    # Local compose fallback
     # -------------------------------
     def local_compose(self, topic_key: str) -> str:
-        """Deterministic, in-depth fallback around 110–140 words, no hashtags, no link."""
-        themes = {
-            "tech_partnerships": {
-                "hook": "Great partnerships feel simple to customers because the hard work is invisible.",
-                "angle": "clarity of ownership and a shared metric.",
-                "example": "When we co-sold with a data platform last year, we published one KPI—‘activated accounts in 30 days’. Sales, CS, and the partner team met weekly against that number.",
-                "tip": "Define the milestone, expose it in both dashboards, and agree on the next experiment before the meeting ends."
-            },
-            "ai": {
-                "hook": "AI wins in the enterprise when it reduces time to value, not just cost.",
-                "angle": "choosing narrow problems with clean data and visible owners.",
-                "example": "A small claims triage bot cut backlog by 18% in six weeks because the inputs were standardized and the handoffs were scripted.",
-                "tip": "Pick one workflow, write the ‘before/after’ in plain English, and automate the boring middle first."
-            },
-            "payments": {
-                "hook": "Payments is a trust business. Speed and acceptance matter; proof beats promises.",
-                "angle": "instrumenting risk, auth rates, and time-to-first-settlement.",
-                "example": "A merchant moved retries to the network edge and lifted approvals by 140 bps without touching checkout.",
-                "tip": "Start with three dials: authorization rate, fraud loss, and settlement timing—then publish them weekly."
-            },
-            "agentic_commerce": {
-                "hook": "Agentic commerce turns browsing into doing by removing decisions, not just clicks.",
-                "angle": "let the system propose the next best action with guardrails.",
-                "example": "A concierge bot pre-fills size and delivery constraints and surfaces two in-stock bundles; abandonment falls because the choice set is sane.",
-                "tip": "Autonomy needs constraints: budget, catalog, and escalation rules—write them down first."
-            },
-            "generative_ai": {
-                "hook": "Generative AI helps when the inputs are reliable and the edits are cheap.",
-                "angle": "tight loops with human accept/reject signals.",
-                "example": "Legal review cut drafting time by 35% using clause templates and a redline diff users could reject in one click.",
-                "tip": "Instrument acceptance rate and rework time; if they stall, fix the prompts or the data—not the marketing."
-            },
-            "ai_automations": {
-                "hook": "Automation shines when it owns the boring work and hands off the hard parts clearly.",
-                "angle": "routing exceptions with context, not tickets.",
-                "example": "Escalations included prior steps, inputs, and confidence; resolution time halved because rework disappeared.",
-                "tip": "Design the ‘stop conditions’ first. Automation without an exit is a support queue."
-            },
+        hooks = {
+            "tech_partnerships": "Partnerships work when both teams invest real resources and chase one metric together.",
+            "ai": "AI wins in the enterprise when it reduces time to value, not just cost.",
+            "payments": "Payments is a trust business. Speed and acceptance matter, proof beats promises.",
+            "agentic_commerce": "Agentic commerce turns browsing into doing. The best agents remove steps, not just clicks.",
+            "generative_ai": "Generative AI helps when it is paired with data quality and strong guardrails.",
+            "ai_automations": "Automation shines when it owns the boring work and hands off the tough parts clearly.",
         }
-
-        d = themes.get(topic_key, themes["tech_partnerships"])
-        lines = [
-            d["hook"],
-            f"The lever is {d['angle']}",
-            d["example"],
-            d["tip"],
-            random.choice(INSIGHT_VARIATIONS),
-        ]
-        text = " ".join(lines)
-        return self.enforce_style_rules(self.debuzz(text))
+        hook = hooks.get(topic_key, "Clarity beats noise.")
+        insight = random.choice(INSIGHT_VARIATIONS)
+        return self.enforce_style_rules(self.debuzz(f"{hook} {insight}"))
 
     # -------------------------------
     # Main run
@@ -1012,8 +988,10 @@ class LinkedInAIAgent:
         # Remove repetitious ending if models used it
         post_body = self._strip_repeated_playbook(post_body)
 
-        # Polish + expand if short
+        # Polish
         post_body = self.polish_with_model(post_body)
+
+        # Assemble, expand if short, and clean
         final_text = self.sanitize_and_finalize(post_body, topic_key, include_link, news_items, state)
 
         # Gate quality
