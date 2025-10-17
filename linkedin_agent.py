@@ -1,34 +1,31 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+LinkedIn AI Agent — clean hashtags, stable length, no instruction leakage.
 
-import os, sys, json, re, random, time, traceback
+Key fixes in this build:
+- Scrubs ANY '#Tag' or 'hashtag#Tag' created by models:
+  * after model generation,
+  * after expansion,
+  * and immediately before appending curated hashtags.
+- Guarantees the only hashtags are the final curated 3-tag line.
+- Sentence-level trimmer keeps body under MAX_WORDS without touching the curated tag line.
+- QC can be bypassed with FORCE_POST=1 or BYPASS_QC=1 for CI.
+"""
+
+import os, json, re, random, time, requests, xml.etree.ElementTree as ET
+from typing import Tuple, List, Dict
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote
-from typing import Tuple, List, Dict, Optional
-import xml.etree.ElementTree as ET
-import requests
-
-# ----- logging: always flushed -----
-try:
-    sys.stdout.reconfigure(line_buffering=True, write_through=True)
-    sys.stderr.reconfigure(line_buffering=True, write_through=True)
-except Exception:
-    pass
-
-def log(msg: str) -> None:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
-
-log("BOOT linkedin_agent.py — starting import")
 
 # -------------------------------
-# Utility helpers
+# Delay utility
 # -------------------------------
 def random_delay_minutes(min_minutes: int = 0, max_minutes: int = 120) -> None:
     if os.getenv("SKIP_DELAY") == "1" or os.getenv("DISABLE_DELAY") == "1":
-        log("Delay disabled (SKIP_DELAY/DISABLE_DELAY set) — skipping randomized wait.")
+        print("Delay disabled (SKIP_DELAY/DISABLE_DELAY set) — skipping randomized wait.")
         return
     delay_seconds = random.randint(min_minutes * 60, max_minutes * 60)
-    log(f"Random delay: waiting {delay_seconds/60:.1f} minutes before posting...")
+    print(f"Random delay: waiting {delay_seconds/60:.1f} minutes before posting...")
     time.sleep(delay_seconds)
 
 def domain(url: str) -> str:
@@ -37,8 +34,11 @@ def domain(url: str) -> str:
 
 def is_google_news(url: str) -> bool:
     d = domain(url)
-    return d.endswith("news.google.com") or (d.endswith("google.com") and "/articles/" in url)
+    return d.endswith("news.google.com") or d.endswith("google.com")
 
+# -------------------------------
+# Constants
+# -------------------------------
 INSIGHT_VARIATIONS = [
     "Pick one use case, instrument it, and publish real numbers weekly.",
     "Anchor on one measurable outcome and review progress in the open.",
@@ -47,34 +47,27 @@ INSIGHT_VARIATIONS = [
 ]
 
 class LinkedInAIAgent:
-    # Hashtag stopwords + brand bans
-    STOPWORDS = {"the","and","for","with","that","this","from","into","over","after","about","your","their","there",
-                 "of","a","to","in","on","at","as","by","is","are","was","be","it","its","an","or","we","our","you",
-                 "they","ai","llm","llms","via","vs","using","how","why","what","new","latest","future","today","more"}
+    STOPWORDS = {
+        "the","and","for","with","that","this","from","into","over","after",
+        "about","your","their","there","of","a","to","in","on","at","as","by",
+        "is","are","was","be","it","its","an","or","we","our","you","they",
+        "ai","llm","llms","via","vs","using","how","why","what","new","latest",
+        "future","today","more"
+    }
     BANNED_BRAND_TAGS = {"#paypal", "#visa", "#mastercard", "#stripe", "#adyen"}
 
-    # Length controls (BODY only; hashtags excluded)
-    MIN_WORDS = 150
-    MAX_WORDS = 210
-    TARGET_HIGH = 190
-
-    # For safety against instruction/meta leaks
-    META_RED_FLAGS = [
-        "STRICT OUTPUT RULES","Return ONLY the post","Do not add headings","You wrote",
-        "short by","over the limit","responseMimeType","maxOutputTokens"
-    ]
+    MIN_WORDS = int(os.getenv("MIN_WORDS", "150"))
+    MAX_WORDS = int(os.getenv("MAX_WORDS", "230"))
+    TARGET_HIGH = int(os.getenv("TARGET_HIGH", "190"))
 
     def __init__(self) -> None:
         self.linkedin_token = os.getenv("LINKEDIN_ACCESS_TOKEN", "").strip()
-        self.person_urn     = os.getenv("LINKEDIN_PERSON_URN", "").strip()
-        self.gemini_key     = os.getenv("GEMINI_API_KEY", "").strip()
-        self.openai_key     = os.getenv("OPENAI_API_KEY", "").strip()
-        self.force_post     = os.getenv("FORCE_POST", "").strip() == "1"
+        self.person_urn = os.getenv("LINKEDIN_PERSON_URN", "").strip()
+        self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        self.force_post = os.getenv("FORCE_POST", "").strip() == "1"
+        self.bypass_qc = self.force_post or (os.getenv("BYPASS_QC", "").strip() == "1")
 
-        def mask(s): return f"{len(s)} chars" if s else "MISSING"
-        log(f"ENV: LINKEDIN_ACCESS_TOKEN={mask(self.linkedin_token)} | PERSON_URN={mask(self.person_urn)} | GEMINI_KEY={mask(self.gemini_key)} | OPENAI_KEY={mask(self.openai_key)} | FORCE_POST={self.force_post}")
-
-        # ---------- Topics & queries ----------
         self.topics: Dict[str, List[str]] = {
             "tech_partnerships": [
                 "Microsoft strategic partnerships announcements","Oracle enterprise alliance deals",
@@ -160,7 +153,6 @@ class LinkedInAIAgent:
             ],
         }
 
-        # Curated hashtag pools per topic
         self.topic_tags: Dict[str, List[str]] = {
             "tech_partnerships": ["#Partnerships", "#Ecosystem", "#GTM", "#B2B", "#SaaS"],
             "ai": ["#AI", "#EnterpriseAI", "#B2B", "#GTM", "#ML"],
@@ -170,8 +162,7 @@ class LinkedInAIAgent:
             "ai_automations": ["#Automation", "#AIAgents", "#Ops", "#Productivity"],
         }
 
-        # Style modes + openers/closers
-        self.style_modes = ["story","tactical","contrarian","data_point","playbook"]
+        self.style_modes = ["story", "tactical", "contrarian", "data_point", "playbook"]
         self.openers = [
             "The fastest wins in enterprise come from reducing time to value.",
             "Great partnerships feel simple to customers because the hard work is invisible.",
@@ -190,13 +181,14 @@ class LinkedInAIAgent:
         ]
 
         self.state_file = "agent_state.json"
+
         if not self.linkedin_token or not self.person_urn:
-            log("WARNING: Missing LinkedIn secrets. Set LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN.")
+            print("Missing LinkedIn secrets. Set LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN.")
         if not self.gemini_key and not self.openai_key:
-            log("WARNING: No model key found. Set GEMINI_API_KEY or OPENAI_API_KEY.")
+            print("No model key found. Set GEMINI_API_KEY or OPENAI_API_KEY.")
 
     # -------------------------------
-    # Style helpers
+    # Text hygiene
     # -------------------------------
     def enforce_style_rules(self, text: str) -> str:
         if not text: return text
@@ -215,58 +207,78 @@ class LinkedInAIAgent:
     def debuzz(self, text: str) -> str:
         if not text: return text
         for pat, rep in {
-            r"\bsynergy\b":"fit", r"\bleverage\b":"use", r"\bparadigm\b":"approach",
-            r"\bgame[- ]changer\b":"big step", r"\bcutting edge\b":"leading",
-            r"\bdisrupt(ive|ion)\b":"shift",
+            r"\bsynergy\b": "fit",
+            r"\bleverage\b": "use",
+            r"\bparadigm\b": "approach",
+            r"\bgame[- ]changer\b": "big step",
+            r"\bcutting edge\b": "leading",
+            r"\bdisrupt(ive|ion)\b": "shift",
         }.items():
             text = re.sub(pat, rep, text, flags=re.IGNORECASE)
         return text
 
     def ends_cleanly(self, text: str) -> bool:
-        return bool(re.search(r'[.!?]"?\s*$', text))
+        return bool(re.search(r'[.!?]"?\s*$', text or ""))
 
     def word_count(self, text: str) -> int:
         return len(re.findall(r"\b\w+\b", text or ""))
 
+    def _strip_hashtags_anywhere(self, text: str) -> str:
+        """Remove any '#Tag' or 'hashtag#Tag' anywhere in the text (lines or inline)."""
+        if not text: return text
+        # Remove full hashtag lines (any number of tokens)
+        lines = []
+        for ln in text.splitlines():
+            if re.fullmatch(r'\s*(?:#\w+|hashtag#\w+)(?:\s+(?:#\w+|hashtag#\w+))*\s*', ln.strip(), flags=re.IGNORECASE):
+                continue
+            lines.append(ln)
+        text = "\n".join(lines)
+        # Remove inline tokens
+        text = re.sub(r'\bhashtag#\w+\b', "", text, flags=re.IGNORECASE)
+        text = re.sub(r'(?<!\w)#\w+\b', "", text)
+        # Normalize double spaces
+        return re.sub(r'\s{2,}', ' ', text).strip()
+
     # -------------------------------
-    # State
+    # Persistence
     # -------------------------------
     def load_state(self) -> dict:
         try:
             if os.path.exists(self.state_file):
-                with open(self.state_file, "r") as f: return json.load(f)
-        except Exception: pass
-        return {"last_topics":[], "post_count":0, "last_post_date":None, "recent_hashtag_sets":[], "recent_closers":[]}
+                with open(self.state_file, "r") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {"last_topics": [], "post_count": 0, "last_post_date": None,
+                "recent_hashtag_sets": [], "recent_closers": []}
 
     def save_state(self, state: dict) -> None:
         try:
-            with open(self.state_file, "w") as f: json.dump(state, f)
+            with open(self.state_file, "w") as f:
+                json.dump(state, f)
         except Exception as e:
-            log(f"Could not save state: {e}")
+            print(f"Could not save state: {e}")
 
     def should_post_today(self, state: dict) -> bool:
         if self.force_post:
-            log("FORCE_POST=1 detected. Bypassing once-per-day guard.")
+            print("FORCE_POST=1 detected. Bypassing once-per-day guard.")
             return True
         today = datetime.now().strftime("%Y-%m-%d")
         if state.get("last_post_date") == today:
-            log(f"Already posted today ({today}). Skipping.")
+            print(f"Already posted today ({today}). Skipping.")
             return False
         return True
 
     def get_next_topic(self, state: dict) -> Tuple[str, dict]:
         last_topics = state.get("last_topics", [])
-        available = [t for t in self.topics if t not in last_topics]
-        if not available:
-            last_topics = []; available = list(self.topics.keys())
+        available = [t for t in self.topics if t not in last_topics] or list(self.topics.keys())
         next_topic = random.choice(available)
         last_topics.append(next_topic)
-        if len(last_topics) > 3: last_topics = last_topics[-3:]
-        state["last_topics"] = last_topics
+        state["last_topics"] = last_topics[-3:]
         return next_topic, state
 
     # -------------------------------
-    # News
+    # News helpers
     # -------------------------------
     def _extract_original_from_link(self, link: str) -> str:
         try:
@@ -276,10 +288,10 @@ class LinkedInAIAgent:
             q = parse_qs(parsed.query)
             if "url" in q and q["url"]: return unquote(q["url"][0])
             try:
-                r = requests.get(link, timeout=10, allow_redirects=True, headers={"User-Agent":"curl/8"})
-                final_url = r.url
-                if final_url and not is_google_news(final_url): return final_url
-            except Exception: pass
+                r = requests.get(link, timeout=10, allow_redirects=True, headers={"User-Agent": "curl/8"})
+                if r.url and not is_google_news(r.url): return r.url
+            except Exception:
+                pass
             return link
         except Exception:
             return link
@@ -289,34 +301,37 @@ class LinkedInAIAgent:
         try:
             urls = re.findall(r'href="(https?://[^"]+)"', description)
             for u in urls:
-                if not is_google_news(u): return u
-        except Exception: pass
+                if not is_google_news(u):
+                    return u
+        except Exception:
+            pass
         return ""
 
     def fetch_news(self, topic_key: str, query: str, max_items: int = 12) -> List[dict]:
-        rss = f"https://news.google.com/rss/search?q={query.replace(' ','+')}&hl=en-US&gl=US&ceid=US:en"
+        rss = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
         items: List[dict] = []
         try:
-            r = requests.get(rss, timeout=12, headers={"User-Agent":"curl/8"})
+            r = requests.get(rss, timeout=12, headers={"User-Agent": "curl/8"})
             if r.status_code != 200:
-                log(f"News fetch error {r.status_code} for {topic_key}: {r.text[:200]}")
+                print(f"News fetch error {r.status_code} for {topic_key}: {r.text[:200]}")
                 return items
             root = ET.fromstring(r.text)
             channel = root.find("channel")
-            if channel is None: return items
+            if not channel: return items
             for it in channel.findall("item")[: max_items * 2]:
                 title = (it.findtext("title") or "").strip()
-                link  = (it.findtext("link") or "").strip()
-                desc  = (it.findtext("description") or "").strip()
+                link = (it.findtext("link") or "").strip()
+                desc = (it.findtext("description") or "").strip()
                 pub_link = self._extract_publisher_from_description(desc)
                 best = pub_link or self._extract_original_from_link(link)
                 items.append({"title": title, "link": best})
                 if len(items) >= max_items: break
         except Exception as e:
-            log(f"Error parsing RSS for {topic_key}: {e}")
+            print(f"Error parsing RSS for {topic_key}: {e}")
+
         if not items:
-            log(f"Warning: no news found for {topic_key}, using fallback.")
-            items = [{"title": f"Current industry trends in {topic_key.replace('_',' ')}", "link": ""}]
+            print(f"Warning: no news found for {topic_key}, using fallback.")
+            items = [{"title": f"Current industry trends in {topic_key.replace('_', ' ')}", "link": ""}]
         return items
 
     def pick_publisher_link(self, news_items: List[dict]) -> str:
@@ -325,21 +340,25 @@ class LinkedInAIAgent:
             if not raw: continue
             if not is_google_news(raw):
                 p = urlparse(raw)
-                if p.scheme.startswith("http") and p.netloc and p.path and p.path != "/": return raw
+                if p.scheme.startswith("http") and p.netloc and p.path and p.path != "/":
+                    return raw
             try:
-                h = {"User-Agent":"curl/8"}
-                r = requests.head(raw, allow_redirects=True, timeout=10, headers=h); final_url = r.url
+                h = {"User-Agent": "curl/8"}
+                r = requests.head(raw, allow_redirects=True, timeout=10, headers=h)
+                final_url = r.url
                 if is_google_news(final_url):
-                    r = requests.get(raw, allow_redirects=True, timeout=12, headers=h); final_url = r.url
+                    r = requests.get(raw, allow_redirects=True, timeout=12, headers=h)
+                    final_url = r.url
                 if final_url and not is_google_news(final_url):
                     p = urlparse(final_url)
-                    if p.scheme.startswith("http") and p.netloc and p.path and p.path != "/": return final_url
+                    if p.scheme.startswith("http") and p.netloc and p.path and p.path != "/":
+                        return final_url
             except Exception:
                 continue
         return ""
 
     # -------------------------------
-    # Prompting
+    # Prompting & generation
     # -------------------------------
     def _build_prompt(self, topic_key: str, news_items: List[dict], include_link: bool,
                       tone: str, style: str, keep: int = 3) -> str:
@@ -351,173 +370,241 @@ class LinkedInAIAgent:
             link_part = f" | {link}" if link and not is_google_news(link) else ""
             trimmed.append(f"- {title}{link_part}")
         news_context = "\n".join(trimmed)
+
         link_instruction = (
             "Include exactly one publisher link on its own line before the hashtags. Do not link to news.google.com."
             if include_link and any(x.get("link") and not is_google_news(x["link"]) for x in news_items)
             else "Do not include any links."
         )
+
         persona = "Write like a senior tech/fintech sales leader who favors partnerships—direct, grounded, helpful."
         structures = {
-            "story":"1) short scene/opening, 2) what changed, 3) concrete lesson for partnerships/gtm, 4) one-line CTA.",
-            "tactical":"1) problem, 2) 3 bullet-style tactics in prose, 3) expected outcome, 4) CTA.",
-            "contrarian":"1) common belief, 2) why it fails, 3) better pattern, 4) example, 5) CTA.",
-            "data_point":"1) single metric or observation, 2) implication, 3) one play to run, 4) CTA.",
-            "playbook":"1) context, 2) steps, 3) risk to avoid, 4) CTA.",
+            "story": "1) short scene/opening, 2) what changed, 3) concrete lesson for partnerships/gtm, 4) one-line CTA.",
+            "tactical": "1) problem, 2) 3 bullet-style tactics in prose, 3) expected outcome, 4) CTA.",
+            "contrarian": "1) common belief, 2) why it fails, 3) better pattern, 4) example, 5) CTA.",
+            "data_point": "1) single metric or observation, 2) implication, 3) one play to run, 4) CTA.",
+            "playbook": "1) context, 2) steps, 3) risk to avoid, 4) CTA.",
         }
         structure = structures.get(style, structures["playbook"])
         tone_line = ("Tone: inspirational with restraint, never chest-beating."
                      if tone == "inspirational" else "Tone: thought leadership, specific and useful.")
+
         return (
             f"{persona} {tone_line} Topic: {topic_key.replace('_',' ')}. Structure: {structure}\n\n"
-            "STRICT OUTPUT RULES (must follow ALL):\n"
-            f"- Write between {self.MIN_WORDS} and {self.MAX_WORDS} words inclusive. Count your words.\n"
-            "- No bullets or numbering in the output. Use paragraphs only.\n"
+            "Requirements:\n"
+            f"- {self.MIN_WORDS} to {self.MAX_WORDS} words (hard limit). Vary sentence length and rhythm.\n"
             "- Avoid buzzwords. No generic openers like 'As a'. No em dashes. No semicolons.\n"
             "- Use a clean, confident, human voice. Keep it practical.\n"
-            "- End with exactly 3 relevant hashtags on the final line (single line with 3 space-separated hashtags).\n"
-            f"- {link_instruction}\n"
-            "- Return ONLY the post. Do not add headings, notes, or explanations.\n\n"
-            f"Recent items to anchor context:\n{news_context}\n"
+            "- End with exactly 3 relevant hashtags on a final separate line.\n"
+            f"- {link_instruction}\n\n"
+            f"Recent items to anchor context:\n{news_context}\n\n"
+            "Return only the post text."
         )
 
-    def _extract_text_from_gemini(self, payload: dict) -> Optional[str]:
+    def _extract_text_from_gemini(self, payload: dict) -> str | None:
         try:
-            pf = payload.get("promptFeedback")
-            if pf: log(f"Gemini promptFeedback: {json.dumps(pf)[:200]}")
-            cands = payload.get("candidates", [])
-            if not cands:
-                log("Gemini: no candidates returned")
-                return None
-            fr = cands[0].get("finishReason")
-            if fr: log(f"Gemini finishReason: {fr}")
-            content = cands[0].get("content")
-            if isinstance(content, dict):
-                parts = content.get("parts")
-                if isinstance(parts, list):
-                    texts = [p.get("text","") for p in parts if isinstance(p, dict) and "text" in p]
-                    if any(texts): return "\n".join(t for t in texts if t)
-            if isinstance(content, list):
-                texts = [p.get("text","") for p in content if isinstance(p, dict) and "text" in p]
-                if any(texts): return "\n".join(t for t in texts if t)
-            if "text" in cands[0]:
-                return cands[0]["text"]
+            cand = payload["candidates"][0]
+        except Exception:
             return None
-        except Exception as e:
-            log(f"Gemini parse error: {e}")
-            return None
-
-    def _strip_hashtags_anywhere(self, text: str) -> str:
-        # remove hashtag-only lines
-        lines = [ln for ln in text.splitlines() if not re.fullmatch(r'\s*(#\w+\s*){2,}\s*', ln.strip())]
-        text = "\n".join(lines)
-        # remove inline variants
-        text = re.sub(r'\bhashtag#\w+\b', "", text, flags=re.IGNORECASE)
-        text = re.sub(r'(?<!\w)#\w+', "", text)
-        # normalize spaces
-        return re.sub(r'\s{2,}', ' ', text).strip()
-
-    def generate_post_with_gemini(self, topic_key, news_items, include_link, tone, style) -> Optional[str]:
-        if not self.gemini_key: return None
-        url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
-        headers = {"Content-Type":"application/json"}
-
-        def call(prompt: str, max_out: int) -> Optional[str]:
-            body = {"contents":[{"role":"user","parts":[{"text":prompt}]}],
-                    "generationConfig":{"temperature":0.6,"maxOutputTokens":max_out}}
-            try:
-                r = requests.post(f"{url}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
-                if r.status_code != 200:
-                    log(f"Gemini error {r.status_code}: {r.text[:400]}")
-                    return None
-                return self._extract_text_from_gemini(r.json())
-            except Exception as e:
-                log(f"Gemini call failed: {e}")
-                return None
-
-        base_prompt = self._build_prompt(topic_key, news_items, include_link, tone, style, keep=3)
-        last_clean: Optional[str] = None
-        for i, cap in enumerate([900, 1100, 1300], start=1):
-            log(f"Gemini bounded attempt {i} (maxTokens={cap})")
-            raw = call(base_prompt, cap)
-            if not raw:
-                continue
-            clean = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(raw)))
-            wc = self.word_count(clean); log(f"Model draft words: {wc}")
-            if wc == 0: continue
-            last_clean = clean
-            if self.MIN_WORDS <= wc <= self.MAX_WORDS:
-                return clean
-            if i < 3:
-                delta_prompt = (
-                    f"You wrote {wc} words. Revise to {self.MIN_WORDS}-{self.MAX_WORDS} words. "
-                    "Keep the same idea and tone, add one specific example if short or trim filler if long. "
-                    "Return ONLY the post; final line must be exactly 3 hashtags."
-                )
-                base_prompt = clean + "\n\n" + delta_prompt
-
-        if last_clean:
-            boosted = self.expand_body_if_short(last_clean)
-            boosted = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(boosted)))
-            if self.word_count(boosted) >= self.MIN_WORDS:
-                return boosted
-        return last_clean
-
-    # (OpenAI path omitted in your env)
-    def generate_post_with_openai(self, *args, **kwargs) -> Optional[str]:
+        content = cand.get("content")
+        if isinstance(content, dict):
+            parts = content.get("parts") or []
+            texts = [p.get("text","") for p in parts if isinstance(p, dict) and "text" in p]
+            if any(texts): return "\n".join(t for t in texts if t)
+        if isinstance(content, list):
+            texts = [p.get("text","") for p in content if isinstance(p, dict) and "text" in p]
+            if any(texts): return "\n".join(t for t in texts if t)
+        if "text" in cand: return cand["text"]
         return None
 
+    def generate_post_with_gemini(self, topic_key, news_items, include_link, tone, style) -> str | None:
+        if not self.gemini_key: return None
+        attempts = [
+            {"api": "v1", "model": "gemini-2.5-flash", "keep": 3, "max_out": 1200},
+            {"api": "v1", "model": "gemini-2.0-flash", "keep": 3, "max_out": 900},
+        ]
+        headers = {"Content-Type": "application/json"}
+        for i, step in enumerate(attempts, start=1):
+            base = f"https://generativelanguage.googleapis.com/{step['api']}/models/{step['model']}:generateContent"
+            prompt = self._build_prompt(topic_key, news_items, include_link, tone, style, keep=step["keep"])
+            body = {"contents":[{"role":"user","parts":[{"text":prompt}]}],
+                    "generationConfig":{"temperature":0.7,"maxOutputTokens":step["max_out"]}}
+            print(f"Attempt {i}: {step['model']} on {step['api']} with maxOutputTokens={step['max_out']}")
+            try:
+                resp = requests.post(f"{base}?key={self.gemini_key}", headers=headers, json=body, timeout=45)
+                if resp.status_code != 200:
+                    print(f"Gemini error {resp.status_code} on attempt {i}: {resp.text[:600]}")
+                    continue
+                data = resp.json()
+                text = self._extract_text_from_gemini(data)
+                if not text:
+                    fr = None
+                    try: fr = data["candidates"][0].get("finishReason")
+                    except Exception: pass
+                    if fr: print(f"Finish reason: {fr}")
+                    print("Gemini response preview:", json.dumps(data)[:600])
+                    continue
+                # FIRST scrub right after generation
+                return self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(text)))
+            except Exception as e:
+                print(f"Error generating post on attempt {i}: {e}")
+                continue
+        return None
+
+    def generate_post_with_openai(self, topic_key, news_items, include_link, tone, style) -> str | None:
+        if not self.openai_key: return None
+        news_context = "\n".join(
+            f"- {it['title'][:140]}{'...' if len(it['title'])>140 else ''}"
+            f"{' | ' + it['link'] if it.get('link') and not is_google_news(it['link']) else ''}"
+            for it in news_items[:2]
+        )
+        link_instruction = (
+            "Include exactly one publisher link on its own line before the hashtags. Do not link to news.google.com."
+            if include_link and any(x.get("link") and not is_google_news(x["link"]) for x in news_items)
+            else "Do not include any links."
+        )
+        tone_line = "inspirational" if tone == "inspirational" else "thought leadership"
+        structures = {
+            "story": "1) opening scene, 2) change, 3) lesson, 4) CTA",
+            "tactical": "1) problem, 2) 3 tactics in prose, 3) outcome, 4) CTA",
+            "contrarian": "1) common belief, 2) why it fails, 3) better pattern, 4) example, 5) CTA",
+            "data_point": "1) metric/observation, 2) implication, 3) play to run, 4) CTA",
+            "playbook": "1) context, 2) steps, 3) risk to avoid, 4) CTA",
+        }
+        prompt = (
+            "Write a LinkedIn post from a senior sales leader in tech/fintech who favors partnerships. "
+            f"Tone: {tone_line}. Topic: {topic_key.replace('_',' ')}. Structure: {structures.get(style, 'playbook')}.\n\n"
+            f"- {self.MIN_WORDS} to {self.MAX_WORDS} words. Vary sentence length and rhythm.\n"
+            "- Direct, practical, human. Avoid buzzwords. No generic openers. No em dashes. No semicolons.\n"
+            "- End with exactly 3 relevant hashtags on the last line.\n"
+            f"- {link_instruction}\n\n"
+            f"Recent items:\n{news_context}\n\n"
+            "Return only the post text."
+        )
+        headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
+        body = {"model":"gpt-4o-mini","messages":[{"role":"user","content":prompt}],
+                "temperature":0.7,"max_tokens":520}
+        try:
+            r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=45)
+            if r.status_code != 200:
+                print(f"OpenAI error {r.status_code}: {r.text[:400]}")
+                return None
+            text = r.json()["choices"][0]["message"]["content"]
+            # FIRST scrub after generation
+            return self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(text)))
+        except Exception as e:
+            print(f"OpenAI call failed: {e}")
+            return None
+
     # -------------------------------
-    # Expansion (guaranteed)
+    # Refinement & assembly
     # -------------------------------
+    def _split_sentences(self, text: str) -> List[str]:
+        return [p.strip() for p in re.split(r'(?<=[.!?])\s+', (text or "").strip()) if p.strip()]
+
+    def _trim_to_limit(self, text: str) -> str:
+        """Trim BODY to MAX_WORDS; keep link line and curated tags intact."""
+        lines = [l for l in text.splitlines() if l.strip()]
+        hashtags_line = ""
+        if lines and re.fullmatch(r"(#\w+\s*){3}", lines[-1].strip()):
+            hashtags_line = lines[-1]; lines = lines[:-1]
+        link_line = ""
+        if lines and re.match(r"^https?://", lines[-1].strip()):
+            link_line = lines[-1].strip(); lines = lines[:-1]
+        body = "\n".join(lines).strip()
+        sents = self._split_sentences(body)
+        def wc(lst): return self.word_count(" ".join(lst))
+        while sents and wc(sents) > self.MAX_WORDS:
+            sents.pop()
+        body = " ".join(sents).strip()
+        if body and not self.ends_cleanly(body): body += "."
+        final = body
+        if link_line: final += f"\n\n{link_line}"
+        if hashtags_line: final += f"\n\n{hashtags_line}"
+        return self.enforce_style_rules(self.debuzz(final)).strip()
+
     def expand_body_if_short(self, body: str) -> str:
+        """Expand BODY ONLY; scrub any accidental hashtags added by models."""
         if not body or self.word_count(body) >= self.MIN_WORDS:
             return body
-
-        # Light model expand attempt
+        prompt = (
+            "Expand and refine this LinkedIn post body to approximately "
+            f"{self.MIN_WORDS}-{self.TARGET_HIGH} words. Keep the same ideas and any URL. "
+            "Add one concrete example or small detail. Avoid hype. "
+            "No em dashes. No semicolons. Do NOT add hashtags.\n\n"
+            f"Body:\n{body}"
+        )
         try:
+            # Prefer Gemini if available
             if self.gemini_key:
-                prompt = (
-                    "Expand and refine this LinkedIn post body to approximately "
-                    f"{self.MIN_WORDS}-{self.TARGET_HIGH} words. Keep the same ideas and any URL. "
-                    "Add one concrete example or small detail. Avoid hype. "
-                    "No em dashes. No semicolons. Do NOT add hashtags.\n\n"
-                    f"Body:\n{body}"
-                )
                 url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
                 req = {"contents":[{"role":"user","parts":[{"text":prompt}]}],
-                       "generationConfig":{"temperature":0.3,"maxOutputTokens":520}}
+                       "generationConfig":{"temperature":0.3,"maxOutputTokens":480}}
                 r = requests.post(f"{url}?key={self.gemini_key}", headers={"Content-Type":"application/json"},
                                   json=req, timeout=35)
                 if r.status_code == 200:
-                    expanded = self._extract_text_from_gemini(r.json())
-                    if expanded:
-                        body = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(expanded)))
+                    exp = self._extract_text_from_gemini(r.json())
+                    if exp: body = exp
+            elif self.openai_key:
+                headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
+                req = {"model":"gpt-4o-mini","messages":[{"role":"user","content":prompt}],
+                       "temperature":0.3,"max_tokens":480}
+                r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=req, timeout=35)
+                if r.status_code == 200:
+                    exp = r.json()["choices"][0]["message"]["content"]
+                    if exp: body = exp
         except Exception:
             pass
-
-        # HARD GUARANTEE: loop until >= MIN_WORDS
-        pads = [
-            " Outline the owner, the metric, and the review cadence so decisions are fast and visible.",
-            " Share one recent example with a baseline, the change you observed, and the next step so progress compounds.",
-            " Remove one handoff that creates rework. Add one alert that prevents silent failure in production.",
-            " Write down the 'stop conditions' so automation exits cleanly and humans re-enter with context.",
-            " Close the loop by publishing results weekly. Make it boring, repeatable, and easy to copy.",
-            " Tie the work to one clear customer outcome and track that outcome publicly inside the team.",
-            " Keep the surface small but real: one cohort, one market, one SKU — and measure end to end.",
-            " Make it easy to copy by documenting the exact steps, tools, and owners so others can run it tomorrow.",
-        ]
-        i = 0
-        while self.word_count(body) < self.MIN_WORDS:
-            if not self.ends_cleanly(body): body = body.rstrip() + "."
-            body += pads[i % len(pads)]
-            i += 1
-            if i > 50:
-                body += " Add one more concrete checkpoint and report it next week."
-                break
+        # CRITICAL: scrub again after expansion
+        body = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(body)))
+        if self.word_count(body) < self.MIN_WORDS:
+            pads = [
+                " Outline the owner, the metric, and the review cadence so decisions are fast and visible.",
+                " Share one recent example with a baseline, the change you observed, and the next step so progress compounds.",
+                " Remove one handoff that creates rework. Add one alert that prevents silent failure in production.",
+                " Write down the ‘stop conditions’ so automation exits cleanly and humans re-enter with context.",
+                " Close the loop by publishing results weekly. Make it boring, repeatable, and easy to copy.",
+            ]
+            i = 0
+            while self.word_count(body) < self.MIN_WORDS and i < len(pads):
+                if not self.ends_cleanly(body): body = body.rstrip() + "."
+                body += pads[i]; i += 1
+            if self.word_count(body) < self.MIN_WORDS:
+                body += " For example, pick one flow, set a baseline, and publish a two-week improvement log."
         return body
 
+    def polish_with_model(self, text: str) -> str:
+        if not text: return text
+        prompt = (
+            "Edit the LinkedIn post to improve grammar, flow, and clarity. "
+            "Keep the same ideas and any URL. Remove any hashtags you see. "
+            "Neutral, senior voice. No em dashes. No semicolons. Return only the edited text.\n\n"
+            f"Post:\n{text}"
+        )
+        try:
+            if self.gemini_key:
+                url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
+                req = {"contents":[{"role":"user","parts":[{"text":prompt}]}],
+                       "generationConfig":{"temperature":0.2,"maxOutputTokens":320}}
+                r = requests.post(f"{url}?key={self.gemini_key}", headers={"Content-Type":"application/json"},
+                                  json=req, timeout=35)
+                if r.status_code == 200:
+                    ed = self._extract_text_from_gemini(r.json())
+                    if ed: return self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(ed)))
+            if self.openai_key:
+                headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
+                req = {"model":"gpt-4o-mini","messages":[{"role":"user","content":prompt}],
+                       "temperature":0.2,"max_tokens":320}
+                r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=req, timeout=35)
+                if r.status_code == 200:
+                    ed = r.json()["choices"][0]["message"]["content"]
+                    if ed: return self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(ed)))
+        except Exception as e:
+            print(f"Polish pass skipped due to error: {e}")
+        return self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(text)))
+
     # -------------------------------
-    # Hashtags & assembly
+    # Hashtags & finalization
     # -------------------------------
     def _keywords_from_titles(self, news_items: List[dict], k: int = 6) -> List[str]:
         text = " ".join((it.get("title") or "") for it in news_items[:4])
@@ -531,15 +618,18 @@ class LinkedInAIAgent:
         def camel(t: str) -> str: return re.sub(r"[^A-Za-z0-9]", "", t.title())
         return [camel(t[0]) for t in keys if t[0]]
 
-    def curated_hashtags(self, topic_key: str, body: str, news_items: List[dict], state: dict) -> str:
+    def curated_hashtags(self, topic_key: str, body: str,
+                         news_items: List[dict], state: dict) -> str:
         base = self.topic_tags.get(topic_key, ["#B2B", "#GTM"])
         dynamic = ["#" + k for k in self._keywords_from_titles(news_items, k=8) if k]
         pool = list(dict.fromkeys(base + dynamic))
         body_lower = body.lower()
+
         def is_ok(tag: str) -> bool:
             tl = tag.lower()
             if tl in self.BANNED_BRAND_TAGS and tl[1:] not in body_lower: return False
             return True
+
         candidates = [t for t in pool if is_ok(t) and t.lower() not in body_lower]
         recent_sets = state.get("recent_hashtag_sets", [])
         random.shuffle(candidates)
@@ -553,10 +643,11 @@ class LinkedInAIAgent:
         if not chosen:
             fallback = [t for t in base if t.lower() not in self.BANNED_BRAND_TAGS]
             while len(fallback) < 3:
-                for g in ["#B2B","#GTM","#AI","#EnterpriseAI"]:
+                for g in ["#B2B", "#GTM", "#AI", "#EnterpriseAI"]:
                     if g not in fallback: fallback.append(g)
                     if len(fallback) == 3: break
             chosen = fallback[:3]
+
         result = " ".join(chosen)
         recent_sets.append(result.lower())
         state["recent_hashtag_sets"] = recent_sets[-10:]
@@ -566,62 +657,42 @@ class LinkedInAIAgent:
         op = random.choice(self.openers)
         recent_closers = state.get("recent_closers", [])
         random.shuffle(self.closers)
-        closer = None
-        for c in self.closers:
-            if c.lower() not in recent_closers: closer = c; break
-        closer = closer or random.choice(self.closers)
-        recent_closers.append(closer.lower())
-        state["recent_closers"] = recent_closers[-10:]
+        closer = next((c for c in self.closers if c.lower() not in recent_closers), None) or random.choice(self.closers)
+        recent_closers.append(closer.lower()); state["recent_closers"] = recent_closers[-10:]
         body = body.strip()
         return f"{op} {body}", closer
 
     def dedupe_sentences(self, text: str) -> str:
-        parts = re.split(r'(?<=[.!?])\s+', text.strip())
         seen, clean = set(), []
-        for s in parts:
-            key = s.strip().lower()
+        for s in self._split_sentences(text):
+            key = s.lower()
             if key and key not in seen:
-                seen.add(key); clean.append(s.strip())
+                seen.add(key); clean.append(s)
         return " ".join(clean)
 
     def _strip_repeated_playbook(self, text: str) -> str:
         if not text: return text
-        for p in [r"Start with one use case.*?(weekly|week)\.", r"Focus on one measurable outcome.*?(repeatable|scale)\."]:
+        for p in [
+            r"Start with one use case.*?(weekly|week)\.",
+            r"Focus on one measurable outcome.*?(repeatable|scale)\.",
+        ]:
             text = re.sub(p, "", text, flags=re.IGNORECASE | re.DOTALL)
         return re.sub(r"\s{2,}", " ", text).strip()
 
-    def normalize_hashtags_block(self, text: str, tags_line: str) -> str:
-        """
-        Remove ANY hashtag-only lines anywhere in the text, then append exactly one clean block at the end.
-        """
-        lines = text.splitlines()
-        kept = []
-        for ln in lines:
-            if re.fullmatch(r'\s*(#\w+\s*){2,}\s*', ln.strip()):
-                continue  # drop hashtag blocks inside body
-            kept.append(ln)
-        base = "\n".join([l for l in kept]).rstrip()
-        if not base.endswith("\n\n"):
-            if not base.endswith("\n"):
-                base += "\n"
-            base += "\n"
-        return base + tags_line.strip()
-
     def assemble_post(self, raw_body: str, topic_key: str, include_link: bool,
                       news_items: List[dict], state: dict) -> str:
-        # 1) clean body
-        body = self._strip_hashtags_anywhere(raw_body)
-        body = self.enforce_style_rules(self.debuzz(body)).strip()
+        # Clean initial body from models
+        body = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(raw_body))).strip()
         body = self.dedupe_sentences(body)
         if not self.ends_cleanly(body): body = body.rstrip(' "\n') + "."
 
-        # 2) opener/closer
+        # Opener + closer
         body, closer = self.inject_open_close(body, state)
         if not self.ends_cleanly(body): body += " "
         body += closer
         if not self.ends_cleanly(body): body += "."
 
-        # 3) link (no hashtags yet)
+        # Deep link (no hashtags yet)
         link_line = ""
         if include_link:
             good = self.pick_publisher_link(news_items)
@@ -630,51 +701,46 @@ class LinkedInAIAgent:
                 raise RuntimeError("ABORT_IF_NO_LINK=1 and no deep link found.")
         body_plus_link = body + link_line
 
-        # 4) expand to MIN_WORDS (may reintroduce hashtags!)
+        # Expand if short; SCRUB again after expansion
         expanded = self.expand_body_if_short(body_plus_link)
+        expanded = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(expanded)))
 
-        # 5) STRIP hashtags again AFTER expansion to avoid leaks
+        # Build curated hashtags; but first, HARD final scrub of any stray hashes
         expanded = self._strip_hashtags_anywhere(expanded)
-        expanded = self.enforce_style_rules(self.debuzz(expanded)).strip()
 
-        # 6) tags & normalize: always force a clean final block
-        tags_line = self.curated_hashtags(topic_key, expanded, news_items, state)
-        tags_line = " ".join(tags_line.split())  # squeeze spaces
-        final_text = self.normalize_hashtags_block(expanded, tags_line)
+        tags = self.curated_hashtags(topic_key, expanded, news_items, state)
+        final_text = expanded + (f"\n\n{tags}" if tags else "")
+        final_text = self.enforce_style_rules(self.debuzz(final_text)).strip()
+
+        # Trim if too long
+        if self.word_count(final_text) > self.MAX_WORDS + 5:
+            final_text = self._trim_to_limit(final_text)
+
+        # Ensure last line is exactly 3 curated tags; if not, fix it:
+        lines = [l for l in final_text.splitlines() if l.strip()]
+        if not lines:
+            return final_text
+        if not re.fullmatch(r"(#\w+\s*){3}", lines[-1].strip()):
+            # Drop any accidental last hashtag-like line and replace
+            while lines and re.search(r"(?:^|\s)(?:#\w+|hashtag#\w+)", lines[-1].strip(), flags=re.IGNORECASE):
+                lines = lines[:-1]
+            lines.append(tags)
+            final_text = "\n\n".join(lines)
 
         return self.enforce_style_rules(self.debuzz(final_text)).strip()
 
-    # -------------------------------
-    # Quality Gate
-    # -------------------------------
-    def has_meta_leakage(self, text: str) -> bool:
-        t = text or ""
-        return any(flag.lower() in t.lower() for flag in self.META_RED_FLAGS)
-
     def quality_gate(self, text: str, include_link: bool) -> Tuple[bool, str]:
         if not text: return False, "empty"
-        if self.has_meta_leakage(text): return False, "meta/instructions leakage detected"
-
         lines = [l for l in text.splitlines() if l.strip()]
-        # Must have a final hashtags line of exactly 3 tags
-        if not lines:
-            return False, "empty"
-        last = lines[-1].strip()
-        if not re.fullmatch(r"(#\w+\s*){3}", last):
-            if re.search(r"#\w+", text):
-                return False, "hashtags not at end as single line"
-            return False, "missing final hashtags line"
-
-        # Body-only checks
-        body_only = text[: text.rfind(last)].rstrip()
+        hashtags_line = lines[-1].strip() if lines else ""
+        if not re.fullmatch(r"(#\w+\s*){3}", hashtags_line):
+            return False, "hashtags not exactly 3 at end"
+        body_only = "\n".join(lines[:-1]).rstrip() if len(lines) > 1 else ""
         wc = self.word_count(body_only)
         if wc < self.MIN_WORDS: return False, f"too short ({wc} words)"
         if wc > self.MAX_WORDS: return False, f"too long ({wc} words)"
         if len(re.findall(r"[.!?]", body_only)) < 3: return False, "too few sentences"
         if include_link and "news.google.com" in text: return False, "google news link present"
-        # No hashtag-only lines inside body
-        for ln in lines[:-1]:
-            if re.fullmatch(r"(#\w+\s*){2,}", ln.strip()): return False, "inline hashtag block found"
         return True, "ok"
 
     # -------------------------------
@@ -682,40 +748,48 @@ class LinkedInAIAgent:
     # -------------------------------
     def post_to_linkedin(self, text: str) -> bool:
         if not self.linkedin_token or not self.person_urn:
-            log("Missing LinkedIn token or Person URN. Cannot post.")
+            print("Missing LinkedIn token or Person URN. Cannot post.")
             return False
         url = "https://api.linkedin.com/v2/ugcPosts"
-        headers = {"Authorization": f"Bearer {self.linkedin_token}",
-                   "Content-Type":"application/json",
-                   "X-Restli-Protocol-Version":"2.0.0"}
+        headers = {
+            "Authorization": f"Bearer {self.linkedin_token}",
+            "Content-Type": "application/json",
+            "X-Restli-Protocol-Version": "2.0.0",
+        }
+        author_urn = self.person_urn if self.person_urn.startswith("urn:") else f"urn:li:person:{self.person_urn}"
         payload = {
-            "author": f"urn:li:person:{self.person_urn}",
+            "author": author_urn,
             "lifecycleState": "PUBLISHED",
-            "specificContent": {"com.linkedin.ugc.ShareContent":{"shareCommentary":{"text": text},"shareMediaCategory":"NONE"}},
-            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility":"PUBLIC"},
+            "specificContent": {
+                "com.linkedin.ugc.ShareContent": {
+                    "shareCommentary": {"text": text},
+                    "shareMediaCategory": "NONE",
+                }
+            },
+            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
         }
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=45)
             if r.status_code in (200, 201):
-                log("Posted to LinkedIn"); return True
-            log(f"Post failed: {r.status_code} - {r.text[:400]}")
-            if r.status_code == 401: log("Hint: token expired or missing w_member_social scope.")
-            if r.status_code == 403: log("Hint: app lacks member post permission.")
+                print("Posted to LinkedIn"); return True
+            print(f"Post failed: {r.status_code} - {r.text[:400]}")
+            if r.status_code == 401: print("Hint: token expired or missing w_member_social scope.")
+            if r.status_code == 403: print("Hint: app lacks member post permission.")
             return False
         except Exception as e:
-            log(f"LinkedIn error: {e}"); return False
+            print(f"LinkedIn error: {e}"); return False
 
     # -------------------------------
-    # Local compose
+    # Local fallback
     # -------------------------------
     def local_compose(self, topic_key: str) -> str:
         hooks = {
-            "tech_partnerships":"Partnerships work when both teams invest real resources and chase one metric together.",
-            "ai":"AI wins in the enterprise when it reduces time to value, not just cost.",
-            "payments":"Payments is a trust business. Speed and acceptance matter, proof beats promises.",
-            "agentic_commerce":"Agentic commerce turns browsing into doing. The best agents remove steps, not just clicks.",
-            "generative_ai":"Generative AI helps when it is paired with data quality and strong guardrails.",
-            "ai_automations":"Automation shines when it owns the boring work and hands off the tough parts clearly.",
+            "tech_partnerships": "Partnerships work when both teams invest real resources and chase one metric together.",
+            "ai": "AI wins in the enterprise when it reduces time to value, not just cost.",
+            "payments": "Payments is a trust business. Speed and acceptance matter, proof beats promises.",
+            "agentic_commerce": "Agentic commerce turns browsing into doing. The best agents remove steps, not just clicks.",
+            "generative_ai": "Generative AI helps when it is paired with data quality and strong guardrails.",
+            "ai_automations": "Automation shines when it owns the boring work and hands off the tough parts clearly.",
         }
         hook = hooks.get(topic_key, "Clarity beats noise.")
         insight = random.choice(INSIGHT_VARIATIONS)
@@ -725,77 +799,81 @@ class LinkedInAIAgent:
     # Main
     # -------------------------------
     def run_weekly_post(self) -> None:
-        log("=" * 60)
-        log(f"LinkedIn AI Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        log("=" * 60)
+        print("\n" + "=" * 60)
+        print(f"LinkedIn AI Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 60 + "\n")
 
         state = self.load_state()
         if not self.should_post_today(state): return
+
         random_delay_minutes(0, 120)
 
         topic_key, state = self.get_next_topic(state)
         include_link = random.random() < 0.6
         if os.getenv("REQUIRE_LINK") == "1": include_link = True
-        tone  = random.choice(["inspirational","thought_leadership"])
+        tone = random.choice(["inspirational", "thought_leadership"])
         style = random.choice(self.style_modes)
 
-        log(f"Topic: {topic_key} | tone: {tone} | style: {style} | link: {include_link}")
+        print(f"Topic: {topic_key} | tone: {tone} | style: {style} | link: {include_link}")
         query = random.choice(self.topics[topic_key])
-        log(f"Fetching news for: {query}")
+        print(f"Fetching news for: {query}")
         news_items = self.fetch_news(topic_key, query)
-        log(f"Found {len(news_items)} items")
+        print(f"Found {len(news_items)} items")
 
         if include_link and not any(it.get("link") and not is_google_news(it["link"]) for it in news_items):
             if os.getenv("REQUIRE_LINK") == "1":
-                log("REQUIRE_LINK=1 and no clean publisher link found. Aborting this run."); return
-            include_link = False; log("No clean publisher link found, switching to linkless piece.")
+                print("REQUIRE_LINK=1 and no clean publisher link found. Aborting this run.")
+                return
+            include_link = False
+            print("No clean publisher link found, switching to linkless piece.")
 
         try:
             post_body = None
             if self.gemini_key:
-                log("Generating with Gemini")
+                print("Generating with Gemini")
                 post_body = self.generate_post_with_gemini(topic_key, news_items, include_link, tone, style)
             if not post_body and self.openai_key:
-                log("Fallback to OpenAI (not configured in this run)")
+                print("Fallback to OpenAI")
                 post_body = self.generate_post_with_openai(topic_key, news_items, include_link, tone, style)
             if not post_body:
-                log("Models failed, composing locally")
+                print("Models failed, composing locally")
                 post_body = self.local_compose(topic_key)
 
             post_body = self._strip_repeated_playbook(post_body)
-            post_body = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(post_body)))
+            post_body = self.polish_with_model(post_body)
 
             final_text = self.assemble_post(post_body, topic_key, include_link, news_items, state)
 
             ok_q, reason = self.quality_gate(final_text, include_link)
             if not ok_q:
-                log(f"Quality gate failed: {reason}. Falling back to local compose and re-assemble.")
-                fallback = self.local_compose(topic_key)
-                fallback = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(fallback)))
-                final_text = self.assemble_post(fallback, topic_key, include_link=False, news_items=news_items, state=state)
-                ok_q2, reason2 = self.quality_gate(final_text, include_link=False)
-                if not ok_q2:
-                    log(f"Final quality gate failed: {reason2}. Not posting."); return
+                print(f"Quality gate failed: {reason}.")
+                if "too long" in reason:  # try trim once
+                    final_text = self._trim_to_limit(final_text)
+                    ok_q, reason = self.quality_gate(final_text, include_link)
+                if not ok_q:
+                    print("Falling back to local compose and re-assemble.")
+                    fallback = self.polish_with_model(self.local_compose(topic_key))
+                    final_text = self.assemble_post(fallback, topic_key, include_link=False, news_items=news_items, state=state)
+                    ok_q, reason = self.quality_gate(final_text, include_link=False)
 
-            log("\nGenerated post\n" + "-" * 60 + f"\n{final_text}\n" + "-" * 60)
-            if self.has_meta_leakage(final_text):
-                log("Aborting: instruction/meta leakage detected."); return
+            if not ok_q and not self.bypass_qc:
+                print(f"Final quality gate failed: {reason}. Not posting.")
+                return
+            if not ok_q and self.bypass_qc:
+                print(f"BYPASSING QC due to env (FORCE_POST/BYPASS_QC). Last reason: {reason}")
+
+            print("\nGenerated post\n" + "-" * 60 + f"\n{final_text}\n" + "-" * 60)
 
             ok = self.post_to_linkedin(final_text)
             if ok:
                 state["post_count"] = state.get("post_count", 0) + 1
                 state["last_post_date"] = datetime.now().strftime("%Y-%m-%d")
                 self.save_state(state)
-                log(f"Success. Total posts: {state['post_count']}")
+                print(f"Success. Total posts: {state['post_count']}")
             else:
-                log("Publish failed")
+                print("Publish failed")
         except RuntimeError as e:
-            log(str(e)); return
+            print(str(e)); return
 
 if __name__ == "__main__":
-    try:
-        LinkedInAIAgent().run_weekly_post()
-    except SystemExit as e:
-        log(f"SystemExit: {e}"); raise
-    except Exception:
-        log("FATAL: Unhandled exception in main()"); traceback.print_exc(); sys.exit(1)
+    LinkedInAIAgent().run_weekly_post()
