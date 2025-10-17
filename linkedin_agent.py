@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-LinkedIn AI Agent — clean hashtags, stable length, no instruction leakage.
+LinkedIn AI Agent — defensive build (no-empty-body, clean hashtags, stable length)
 
-Key fixes in this build:
-- Scrubs ANY '#Tag' or 'hashtag#Tag' created by models:
-  * after model generation,
-  * after expansion,
-  * and immediately before appending curated hashtags.
-- Guarantees the only hashtags are the final curated 3-tag line.
-- Sentence-level trimmer keeps body under MAX_WORDS without touching the curated tag line.
-- QC can be bypassed with FORCE_POST=1 or BYPASS_QC=1 for CI.
+Fixes:
+- Never publish only hashtags: body safety checks at every stage with rollback.
+- QC no longer bypassed by FORCE_POST (use BYPASS_QC=1 explicitly).
+- Model outputs are guarded; if edit/expand returns empty/short, revert to previous text.
+- Dynamic hashtag mining prunes junk (#Work, #Blog, etc.) and prefers vetted tags.
 """
 
 import os, json, re, random, time, requests, xml.etree.ElementTree as ET
@@ -46,6 +43,8 @@ INSIGHT_VARIATIONS = [
     "Ship something small, measure honestly, scale what actually works.",
 ]
 
+BLOCKED_DYNAMIC = {"work", "blog", "today", "news", "update"}
+
 class LinkedInAIAgent:
     STOPWORDS = {
         "the","and","for","with","that","this","from","into","over","after",
@@ -66,7 +65,8 @@ class LinkedInAIAgent:
         self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
         self.openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.force_post = os.getenv("FORCE_POST", "").strip() == "1"
-        self.bypass_qc = self.force_post or (os.getenv("BYPASS_QC", "").strip() == "1")
+        # IMPORTANT: QC is *not* bypassed by FORCE_POST anymore
+        self.bypass_qc = (os.getenv("BYPASS_QC", "").strip() == "1")
 
         self.topics: Dict[str, List[str]] = {
             "tech_partnerships": [
@@ -224,19 +224,17 @@ class LinkedInAIAgent:
         return len(re.findall(r"\b\w+\b", text or ""))
 
     def _strip_hashtags_anywhere(self, text: str) -> str:
-        """Remove any '#Tag' or 'hashtag#Tag' anywhere in the text (lines or inline)."""
         if not text: return text
-        # Remove full hashtag lines (any number of tokens)
-        lines = []
+        # remove full lines that are only hashtags (incl. 'hashtag#Word')
+        cleaned_lines = []
         for ln in text.splitlines():
             if re.fullmatch(r'\s*(?:#\w+|hashtag#\w+)(?:\s+(?:#\w+|hashtag#\w+))*\s*', ln.strip(), flags=re.IGNORECASE):
                 continue
-            lines.append(ln)
-        text = "\n".join(lines)
-        # Remove inline tokens
+            cleaned_lines.append(ln)
+        text = "\n".join(cleaned_lines)
+        # remove inline tokens
         text = re.sub(r'\bhashtag#\w+\b', "", text, flags=re.IGNORECASE)
         text = re.sub(r'(?<!\w)#\w+\b', "", text)
-        # Normalize double spaces
         return re.sub(r'\s{2,}', ' ', text).strip()
 
     # -------------------------------
@@ -420,8 +418,8 @@ class LinkedInAIAgent:
     def generate_post_with_gemini(self, topic_key, news_items, include_link, tone, style) -> str | None:
         if not self.gemini_key: return None
         attempts = [
-            {"api": "v1", "model": "gemini-2.5-flash", "keep": 3, "max_out": 1200},
-            {"api": "v1", "model": "gemini-2.0-flash", "keep": 3, "max_out": 900},
+            {"api": "v1", "model": "gemini-2.5-flash", "keep": 3, "max_out": 900},
+            {"api": "v1", "model": "gemini-2.0-flash", "keep": 3, "max_out": 700},
         ]
         headers = {"Content-Type": "application/json"}
         for i, step in enumerate(attempts, start=1):
@@ -444,8 +442,11 @@ class LinkedInAIAgent:
                     if fr: print(f"Finish reason: {fr}")
                     print("Gemini response preview:", json.dumps(data)[:600])
                     continue
-                # FIRST scrub right after generation
-                return self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(text)))
+                # scrub immediately
+                clean = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(text)))
+                if self.word_count(clean) == 0:
+                    continue
+                return clean
             except Exception as e:
                 print(f"Error generating post on attempt {i}: {e}")
                 continue
@@ -483,15 +484,17 @@ class LinkedInAIAgent:
         )
         headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
         body = {"model":"gpt-4o-mini","messages":[{"role":"user","content":prompt}],
-                "temperature":0.7,"max_tokens":520}
+                "temperature":0.7,"max_tokens":600}
         try:
             r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=45)
             if r.status_code != 200:
                 print(f"OpenAI error {r.status_code}: {r.text[:400]}")
                 return None
             text = r.json()["choices"][0]["message"]["content"]
-            # FIRST scrub after generation
-            return self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(text)))
+            clean = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(text)))
+            if self.word_count(clean) == 0:
+                return None
+            return clean
         except Exception as e:
             print(f"OpenAI call failed: {e}")
             return None
@@ -503,7 +506,6 @@ class LinkedInAIAgent:
         return [p.strip() for p in re.split(r'(?<=[.!?])\s+', (text or "").strip()) if p.strip()]
 
     def _trim_to_limit(self, text: str) -> str:
-        """Trim BODY to MAX_WORDS; keep link line and curated tags intact."""
         lines = [l for l in text.splitlines() if l.strip()]
         hashtags_line = ""
         if lines and re.fullmatch(r"(#\w+\s*){3}", lines[-1].strip()):
@@ -514,7 +516,8 @@ class LinkedInAIAgent:
         body = "\n".join(lines).strip()
         sents = self._split_sentences(body)
         def wc(lst): return self.word_count(" ".join(lst))
-        while sents and wc(sents) > self.MAX_WORDS:
+        # trim safely
+        while len(sents) > 1 and wc(sents) > self.MAX_WORDS:
             sents.pop()
         body = " ".join(sents).strip()
         if body and not self.ends_cleanly(body): body += "."
@@ -524,9 +527,9 @@ class LinkedInAIAgent:
         return self.enforce_style_rules(self.debuzz(final)).strip()
 
     def expand_body_if_short(self, body: str) -> str:
-        """Expand BODY ONLY; scrub any accidental hashtags added by models."""
         if not body or self.word_count(body) >= self.MIN_WORDS:
             return body
+        original = body  # rollback point
         prompt = (
             "Expand and refine this LinkedIn post body to approximately "
             f"{self.MIN_WORDS}-{self.TARGET_HIGH} words. Keep the same ideas and any URL. "
@@ -535,7 +538,6 @@ class LinkedInAIAgent:
             f"Body:\n{body}"
         )
         try:
-            # Prefer Gemini if available
             if self.gemini_key:
                 url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
                 req = {"contents":[{"role":"user","parts":[{"text":prompt}]}],
@@ -555,8 +557,10 @@ class LinkedInAIAgent:
                     if exp: body = exp
         except Exception:
             pass
-        # CRITICAL: scrub again after expansion
         body = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(body)))
+        # rollback if model nuked the text
+        if self.word_count(body) == 0:
+            body = self.enforce_style_rules(self.debuzz(original))
         if self.word_count(body) < self.MIN_WORDS:
             pads = [
                 " Outline the owner, the metric, and the review cadence so decisions are fast and visible.",
@@ -575,6 +579,7 @@ class LinkedInAIAgent:
 
     def polish_with_model(self, text: str) -> str:
         if not text: return text
+        original = text  # rollback point
         prompt = (
             "Edit the LinkedIn post to improve grammar, flow, and clarity. "
             "Keep the same ideas and any URL. Remove any hashtags you see. "
@@ -590,7 +595,10 @@ class LinkedInAIAgent:
                                   json=req, timeout=35)
                 if r.status_code == 200:
                     ed = self._extract_text_from_gemini(r.json())
-                    if ed: return self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(ed)))
+                    if ed:
+                        ed = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(ed)))
+                        if self.word_count(ed) >= 10:
+                            return ed
             if self.openai_key:
                 headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
                 req = {"model":"gpt-4o-mini","messages":[{"role":"user","content":prompt}],
@@ -598,10 +606,13 @@ class LinkedInAIAgent:
                 r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=req, timeout=35)
                 if r.status_code == 200:
                     ed = r.json()["choices"][0]["message"]["content"]
-                    if ed: return self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(ed)))
-        except Exception as e:
-            print(f"Polish pass skipped due to error: {e}")
-        return self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(text)))
+                    ed = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(ed)))
+                    if self.word_count(ed) >= 10:
+                        return ed
+        except Exception:
+            pass
+        # rollback to original if polish failed
+        return self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(original)))
 
     # -------------------------------
     # Hashtags & finalization
@@ -612,7 +623,7 @@ class LinkedInAIAgent:
         freq: Dict[str, int] = {}
         for w in words:
             wl = w.lower()
-            if wl in self.STOPWORDS or len(wl) < 4: continue
+            if wl in self.STOPWORDS or len(wl) < 4 or wl in BLOCKED_DYNAMIC: continue
             freq[wl] = freq.get(wl, 0) + 1
         keys = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:k]
         def camel(t: str) -> str: return re.sub(r"[^A-Za-z0-9]", "", t.title())
@@ -622,19 +633,22 @@ class LinkedInAIAgent:
                          news_items: List[dict], state: dict) -> str:
         base = self.topic_tags.get(topic_key, ["#B2B", "#GTM"])
         dynamic = ["#" + k for k in self._keywords_from_titles(news_items, k=8) if k]
+        # Filter dynamic: keep alnum, length >= 4, not blocked
+        def valid(tag: str) -> bool:
+            t = tag[1:]
+            return (len(t) >= 4) and t.isalnum() and (t.lower() not in BLOCKED_DYNAMIC)
+        dynamic = [t for t in dynamic if valid(t)]
         pool = list(dict.fromkeys(base + dynamic))
         body_lower = body.lower()
-
         def is_ok(tag: str) -> bool:
             tl = tag.lower()
             if tl in self.BANNED_BRAND_TAGS and tl[1:] not in body_lower: return False
             return True
-
         candidates = [t for t in pool if is_ok(t) and t.lower() not in body_lower]
         recent_sets = state.get("recent_hashtag_sets", [])
         random.shuffle(candidates)
         chosen = None
-        for i in range(min(20, len(candidates))):
+        for i in range(min(30, len(candidates))):
             trio = candidates[i:i+3]
             if len(trio) < 3: break
             trial = " ".join(trio)
@@ -647,7 +661,6 @@ class LinkedInAIAgent:
                     if g not in fallback: fallback.append(g)
                     if len(fallback) == 3: break
             chosen = fallback[:3]
-
         result = " ".join(chosen)
         recent_sets.append(result.lower())
         state["recent_hashtag_sets"] = recent_sets[-10:]
@@ -659,8 +672,7 @@ class LinkedInAIAgent:
         random.shuffle(self.closers)
         closer = next((c for c in self.closers if c.lower() not in recent_closers), None) or random.choice(self.closers)
         recent_closers.append(closer.lower()); state["recent_closers"] = recent_closers[-10:]
-        body = body.strip()
-        return f"{op} {body}", closer
+        return f"{op} {body.strip()}", closer
 
     def dedupe_sentences(self, text: str) -> str:
         seen, clean = set(), []
@@ -681,8 +693,12 @@ class LinkedInAIAgent:
 
     def assemble_post(self, raw_body: str, topic_key: str, include_link: bool,
                       news_items: List[dict], state: dict) -> str:
-        # Clean initial body from models
+        # Step 0: initial clean; keep a rollback
         body = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(raw_body))).strip()
+        if self.word_count(body) == 0:  # never start empty
+            body = "Clarity beats noise. Execution beats theater. Results beat headlines."
+
+        # Dedupe + terminate
         body = self.dedupe_sentences(body)
         if not self.ends_cleanly(body): body = body.rstrip(' "\n') + "."
 
@@ -701,38 +717,50 @@ class LinkedInAIAgent:
                 raise RuntimeError("ABORT_IF_NO_LINK=1 and no deep link found.")
         body_plus_link = body + link_line
 
-        # Expand if short; SCRUB again after expansion
+        # Expand if short; SCRUB again after expansion; rollback if nuked
+        before_expand = body_plus_link
         expanded = self.expand_body_if_short(body_plus_link)
         expanded = self.enforce_style_rules(self.debuzz(self._strip_hashtags_anywhere(expanded)))
+        if self.word_count(expanded) == 0:
+            expanded = before_expand  # rollback guarantee
 
-        # Build curated hashtags; but first, HARD final scrub of any stray hashes
+        # Build curated hashtags; final scrub to ensure no inline hashes in body
         expanded = self._strip_hashtags_anywhere(expanded)
-
         tags = self.curated_hashtags(topic_key, expanded, news_items, state)
         final_text = expanded + (f"\n\n{tags}" if tags else "")
         final_text = self.enforce_style_rules(self.debuzz(final_text)).strip()
 
-        # Trim if too long
+        # Trim if too long (does not drop body entirely)
         if self.word_count(final_text) > self.MAX_WORDS + 5:
             final_text = self._trim_to_limit(final_text)
 
-        # Ensure last line is exactly 3 curated tags; if not, fix it:
+        # Ensure last line is exactly 3 curated tags and BODY not empty
         lines = [l for l in final_text.splitlines() if l.strip()]
         if not lines:
-            return final_text
+            lines = ["Execution beats theater. Results beat headlines.", tags]
         if not re.fullmatch(r"(#\w+\s*){3}", lines[-1].strip()):
-            # Drop any accidental last hashtag-like line and replace
+            # remove any accidental hashtag-like tail then add curated
             while lines and re.search(r"(?:^|\s)(?:#\w+|hashtag#\w+)", lines[-1].strip(), flags=re.IGNORECASE):
                 lines = lines[:-1]
             lines.append(tags)
-            final_text = "\n\n".join(lines)
-
-        return self.enforce_style_rules(self.debuzz(final_text)).strip()
+        # If the body is empty (only tags), synthesize a safe body from local template
+        body_only = "\n".join(lines[:-1]).strip()
+        if self.word_count(body_only) == 0:
+            safe = self.local_compose(topic_key)
+            safe = self.enforce_style_rules(self.debuzz(safe))
+            if not self.ends_cleanly(safe): safe += "."
+            if include_link and not link_line:
+                good = self.pick_publisher_link(news_items)
+                if good: safe += f"\n\n{good}"
+            lines = [safe, tags]
+        final_text = "\n\n".join(lines).strip()
+        return final_text
 
     def quality_gate(self, text: str, include_link: bool) -> Tuple[bool, str]:
         if not text: return False, "empty"
         lines = [l for l in text.splitlines() if l.strip()]
-        hashtags_line = lines[-1].strip() if lines else ""
+        if not lines: return False, "empty"
+        hashtags_line = lines[-1].strip()
         if not re.fullmatch(r"(#\w+\s*){3}", hashtags_line):
             return False, "hashtags not exactly 3 at end"
         body_only = "\n".join(lines[:-1]).rstrip() if len(lines) > 1 else ""
@@ -840,19 +868,24 @@ class LinkedInAIAgent:
                 post_body = self.local_compose(topic_key)
 
             post_body = self._strip_repeated_playbook(post_body)
-            post_body = self.polish_with_model(post_body)
+
+            # Polish but rollback if model ruins content
+            polished = self.polish_with_model(post_body)
+            if self.word_count(polished) == 0:
+                polished = post_body
+            post_body = polished
 
             final_text = self.assemble_post(post_body, topic_key, include_link, news_items, state)
 
             ok_q, reason = self.quality_gate(final_text, include_link)
             if not ok_q:
                 print(f"Quality gate failed: {reason}.")
-                if "too long" in reason:  # try trim once
+                if "too long" in reason:
                     final_text = self._trim_to_limit(final_text)
                     ok_q, reason = self.quality_gate(final_text, include_link)
                 if not ok_q:
                     print("Falling back to local compose and re-assemble.")
-                    fallback = self.polish_with_model(self.local_compose(topic_key))
+                    fallback = self.local_compose(topic_key)
                     final_text = self.assemble_post(fallback, topic_key, include_link=False, news_items=news_items, state=state)
                     ok_q, reason = self.quality_gate(final_text, include_link=False)
 
@@ -860,7 +893,7 @@ class LinkedInAIAgent:
                 print(f"Final quality gate failed: {reason}. Not posting.")
                 return
             if not ok_q and self.bypass_qc:
-                print(f"BYPASSING QC due to env (FORCE_POST/BYPASS_QC). Last reason: {reason}")
+                print(f"BYPASSING QC due to env (BYPASS_QC=1). Last reason: {reason}")
 
             print("\nGenerated post\n" + "-" * 60 + f"\n{final_text}\n" + "-" * 60)
 
