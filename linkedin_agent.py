@@ -10,8 +10,9 @@ Key improvements:
 - Forces deep publisher links (no Google News); otherwise posts linkless.
 - Quality gate (length, sentence count, hashtag placement, link checks).
 - Optional delay skip via SKIP_DELAY=1 or DISABLE_DELAY=1 for CI/manual runs.
-- Optional REQUIRE_LINK=1 to prefer posts with a publisher link when available.
-- Final expansion pass guarantees MIN_WORDS length even on local fallback.
+- Optional REQUIRE_LINK=1 to require a publisher link when available.
+- Optional ABORT_IF_NO_LINK=1 to abort posting if no deep link is found.
+- Final expansion pass guarantees MIN_WORDS even on local fallback (no API).
 """
 
 import os
@@ -286,25 +287,16 @@ class LinkedInAIAgent:
     def enforce_style_rules(self, text: str) -> str:
         if not text:
             return text
-
-        # normalize punctuation
         text = text.replace("—", ",").replace("–", ",").replace(";", ",")
-
-        # remove "As a ..." opener
         text = re.sub(r"^\s*As a [^.!\n]+[, ]+", "", text, flags=re.IGNORECASE)
-
-        # ensure single space after punctuation, and tidy spaces
         text = re.sub(r"\s*,\s*", ", ", text)
         text = re.sub(r"\s*\.\s*", ". ", text)
         text = re.sub(r"\s*!\s*", "! ", text)
         text = re.sub(r"\s*\?\s*", "? ", text)
         text = re.sub(r"[ \t]{2,}", " ", text)
         text = re.sub(r"\s+([,!.?])", r"\1", text)
-
-        # strip stray opening quote if unmatched
         if text.count('"') % 2 == 1 and text.strip().startswith('"'):
             text = text.lstrip('"').lstrip()
-
         return text.strip()
 
     def debuzz(self, text: str) -> str:
@@ -404,7 +396,6 @@ class LinkedInAIAgent:
         if not description:
             return ""
         try:
-            # Prefer any non-Google href in the RSS description
             urls = re.findall(r'href="(https?://[^"]+)"', description)
             for u in urls:
                 if not is_google_news(u):
@@ -413,7 +404,7 @@ class LinkedInAIAgent:
             pass
         return ""
 
-    def fetch_news(self, topic_key: str, query: str, max_items: int = 6) -> List[dict]:
+    def fetch_news(self, topic_key: str, query: str, max_items: int = 12) -> List[dict]:
         rss = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
         items: List[dict] = []
         try:
@@ -453,12 +444,12 @@ class LinkedInAIAgent:
             raw = (it.get("link") or "").strip()
             if not raw:
                 continue
-            # If it's already a direct publisher link with a path, accept it
+            # Direct publisher link?
             if not is_google_news(raw):
                 parsed = urlparse(raw)
                 if parsed.scheme.startswith("http") and parsed.netloc and parsed.path and parsed.path != "/":
                     return raw
-            # Otherwise resolve Google redirect via HEAD, then GET as fallback
+            # Resolve Google redirect via HEAD, then GET
             try:
                 h = {"User-Agent": "curl/8"}
                 r = requests.head(raw, allow_redirects=True, timeout=10, headers=h)
@@ -478,7 +469,7 @@ class LinkedInAIAgent:
     # Prompting & generation
     # -------------------------------
     def _build_prompt(self, topic_key: str, news_items: List[dict], include_link: bool,
-                      tone: str, style: str, keep: int = 2) -> str:
+                      tone: str, style: str, keep: int = 3) -> str:
         trimmed = []
         for it in news_items[:keep]:
             t = (it["title"] or "").strip()
@@ -512,7 +503,7 @@ class LinkedInAIAgent:
         prompt = (
             f"{persona} {tone_line} Topic: {topic_key.replace('_', ' ')}. {structure}\n\n"
             "Requirements:\n"
-            "- 150 to 220 words (hard limit). Vary sentence length and rhythm.\n"
+            f"- {self.MIN_WORDS} to 220 words (hard limit). Vary sentence length and rhythm.\n"
             "- Avoid buzzwords. No generic openers like 'As a'. No em dashes. No semicolons.\n"
             "- Use a clean, confident, human voice. Keep it practical.\n"
             "- End with exactly 3 relevant hashtags on a final separate line.\n"
@@ -615,7 +606,7 @@ class LinkedInAIAgent:
             "Write a LinkedIn post from a senior sales leader in tech/fintech who favors partnerships. "
             f"Tone: {tone_line}. Topic: {topic_key.replace('_', ' ')}. Structure: {structures.get(style, 'playbook')}.\n\n"
             "Requirements:\n"
-            "- 150 to 220 words. Vary sentence length and rhythm.\n"
+            f"- {self.MIN_WORDS} to 220 words. Vary sentence length and rhythm.\n"
             "- Direct, practical, human. Avoid buzzwords. No generic openers. No em dashes. No semicolons.\n"
             "- End with exactly 3 relevant hashtags on the last line.\n"
             f"- {link_instruction}\n\n"
@@ -674,6 +665,33 @@ class LinkedInAIAgent:
                         return self.enforce_style_rules(self.debuzz(expanded))
         except Exception:
             pass
+        return text
+
+    def _local_expand_to_min(self, text: str) -> str:
+        """Guaranteed expansion to >= MIN_WORDS without calling any API."""
+        if not text:
+            return text
+        wc = self.word_count(text)
+        if wc >= self.MIN_WORDS:
+            return text
+
+        pads = [
+            " Outline the owner, the metric, and the review cadence so decisions are fast and visible.",
+            " Share one recent example with baseline, change, and the next step so progress compounds.",
+            " Remove one handoff that creates rework. Add one alert that prevents silent failure.",
+            " Write down the ‘stop conditions’ so automation exits cleanly and humans re-enter with context.",
+            " Close the loop by publishing results weekly. Make it boring, repeatable, and easy to copy.",
+        ]
+        i = 0
+        while wc < self.MIN_WORDS and i < len(pads):
+            if not text.endswith(('.', '!', '?')):
+                text = text.rstrip() + "."
+            text += pads[i]
+            wc = self.word_count(text)
+            i += 1
+
+        if wc < self.MIN_WORDS:
+            text += " For example, pick one flow, set a baseline, and publish a two-week improvement log."
         return text
 
     def polish_with_model(self, text: str) -> str:
@@ -735,7 +753,6 @@ class LinkedInAIAgent:
         dynamic = ["#" + k for k in self._keywords_from_titles(news_items, k=8) if k]
         pool = list(dict.fromkeys(base + dynamic))  # unique, keep order
 
-        # no brand tags unless body mentions the brand
         body_lower = body.lower()
 
         def is_ok(tag: str) -> bool:
@@ -746,7 +763,6 @@ class LinkedInAIAgent:
 
         candidates = [t for t in pool if is_ok(t) and t.lower() not in body_lower]
 
-        # Choose 3 but avoid recent repeats
         recent_sets = state.get("recent_hashtag_sets", [])
         random.shuffle(candidates)
         chosen = None
@@ -759,7 +775,6 @@ class LinkedInAIAgent:
                 chosen = trio
                 break
 
-        # fallback
         if not chosen:
             fallback = [t for t in base if t.lower() not in self.BANNED_BRAND_TAGS]
             while len(fallback) < 3:
@@ -777,7 +792,6 @@ class LinkedInAIAgent:
 
     def inject_open_close(self, body: str, state: dict) -> Tuple[str, str]:
         op = random.choice(self.openers)
-        # rotate closers avoiding recent repeats
         recent_closers = state.get("recent_closers", [])
         random.shuffle(self.closers)
         closer = None
@@ -817,25 +831,20 @@ class LinkedInAIAgent:
 
     def sanitize_and_finalize(self, body: str, topic_key: str, include_link: bool,
                               news_items: List[dict], state: dict) -> str:
-        # remove hashtag lines inside body
         lines = [ln for ln in body.splitlines() if not re.fullmatch(r'\s*(#\w+\s*){2,}\s*', ln.strip())]
         body = "\n".join(lines)
-        # remove inline stray hashtags
         body = re.sub(r'(?<!\w)#\w+', "", body)
 
         body = self.enforce_style_rules(self.debuzz(body)).strip()
 
-        # remove trailing hashtags line if model added one
         m = re.search(r'(^|\n)\s*(#\w+(?:\s+#\w+){1,})\s*$', body, flags=re.IGNORECASE | re.MULTILINE)
         if m:
             body = body[: m.start()].rstrip()
 
-        # De-dupe and ensure clean end before open/close
         body = self.dedupe_sentences(body)
         if not self.ends_cleanly(body):
             body = body.rstrip(' "\n') + "."
 
-        # Inject opener and closer
         body, closer = self.inject_open_close(body, state)
         if not self.ends_cleanly(body):
             body += " "
@@ -843,38 +852,36 @@ class LinkedInAIAgent:
         if not self.ends_cleanly(body):
             body += "."
 
-        # Link (deep publisher only)
         link_line = ""
         if include_link:
             good = self.pick_publisher_link(news_items)
             if good:
                 link_line = f"\n\n{good}"
+            elif os.getenv("ABORT_IF_NO_LINK") == "1":
+                raise RuntimeError("ABORT_IF_NO_LINK=1 and no deep link found.")
 
-        # Hashtags
         tags = self.curated_hashtags(topic_key, body, news_items, state)
         hashtags_line = f"\n\n{tags}" if tags else ""
 
-        # Assemble
         final_text = body + link_line + hashtags_line
 
-        # FINAL length enforcement: expand if still short
+        # Try model-based expansion first; if it fails, guarantee locally
         final_text = self.expand_if_short(final_text)
+        final_text = self._local_expand_to_min(final_text)
 
         return self.enforce_style_rules(self.debuzz(final_text)).strip()
 
     def quality_gate(self, text: str, include_link: bool) -> Tuple[bool, str]:
-        """Return (ok, reason) to decide if a post is publishable."""
         if not text:
             return False, "empty"
         wc = self.word_count(text)
         if wc < self.MIN_WORDS:
             return False, f"too short ({wc} words)"
-        if wc > 210:
+        if wc > 220:
             return False, f"too long ({wc} words)"
         if len(re.findall(r"[.!?]", text)) < 3:
             return False, "too few sentences"
 
-        # hashtags must be a final block if present
         lines = [l for l in text.splitlines() if l.strip()]
         if lines:
             last = lines[-1].strip()
@@ -954,7 +961,6 @@ class LinkedInAIAgent:
         if not self.should_post_today(state):
             return
 
-        # Randomize time in window (skipped if SKIP_DELAY/DISABLE_DELAY=1)
         random_delay_minutes(min_minutes=0, max_minutes=120)
 
         topic_key, state = self.get_next_topic(state)
@@ -971,47 +977,56 @@ class LinkedInAIAgent:
         print(f"Found {len(news_items)} items")
 
         if include_link and not any(it.get("link") and not is_google_news(it["link"]) for it in news_items):
+            if os.getenv("REQUIRE_LINK") == "1":
+                print("REQUIRE_LINK=1 and no clean publisher link found. Aborting this run.")
+                return
             include_link = False
             print("No clean publisher link found, switching to linkless piece.")
 
-        post_body = None
-        if self.gemini_key:
-            print("Generating with Gemini")
-            post_body = self.generate_post_with_gemini(topic_key, news_items, include_link, tone, style)
-        if not post_body and self.openai_key:
-            print("Fallback to OpenAI")
-            post_body = self.generate_post_with_openai(topic_key, news_items, include_link, tone, style)
-        if not post_body:
-            print("Models failed, composing locally")
-            post_body = self.local_compose(topic_key)
+        try:
+            post_body = None
+            if self.gemini_key:
+                print("Generating with Gemini")
+                post_body = self.generate_post_with_gemini(topic_key, news_items, include_link, tone, style)
+            if not post_body and self.openai_key:
+                print("Fallback to OpenAI")
+                post_body = self.generate_post_with_openai(topic_key, news_items, include_link, tone, style)
+            if not post_body:
+                print("Models failed, composing locally")
+                post_body = self.local_compose(topic_key)
 
-        # Remove repetitious ending if models used it
-        post_body = self._strip_repeated_playbook(post_body)
+            post_body = self._strip_repeated_playbook(post_body)
+            post_body = self.polish_with_model(post_body)
 
-        # Polish
-        post_body = self.polish_with_model(post_body)
+            final_text = self.sanitize_and_finalize(post_body, topic_key, include_link, news_items, state)
 
-        # Assemble, expand if short, and clean
-        final_text = self.sanitize_and_finalize(post_body, topic_key, include_link, news_items, state)
+            # First quality gate
+            ok_q, reason = self.quality_gate(final_text, include_link)
+            if not ok_q:
+                print(f"Quality gate failed: {reason}. Falling back to local compose.")
+                fallback = self.local_compose(topic_key)
+                fallback = self.polish_with_model(fallback)
+                final_text = self.sanitize_and_finalize(fallback, topic_key, False, news_items, state)
 
-        # Gate quality
-        ok_q, reason = self.quality_gate(final_text, include_link)
-        if not ok_q:
-            print(f"Quality gate failed: {reason}. Falling back to local compose.")
-            fallback = self.local_compose(topic_key)
-            fallback = self.polish_with_model(fallback)
-            final_text = self.sanitize_and_finalize(fallback, topic_key, False, news_items, state)
+                # Second/Final quality gate — do NOT post if still failing
+                ok_q2, reason2 = self.quality_gate(final_text, include_link=False)
+                if not ok_q2:
+                    print(f"Final quality gate failed after fallback: {reason2}. Not posting.")
+                    return
 
-        print("\nGenerated post\n" + "-" * 60 + f"\n{final_text}\n" + "-" * 60)
+            print("\nGenerated post\n" + "-" * 60 + f"\n{final_text}\n" + "-" * 60)
 
-        ok = self.post_to_linkedin(final_text)
-        if ok:
-            state["post_count"] = state.get("post_count", 0) + 1
-            state["last_post_date"] = datetime.now().strftime("%Y-%m-%d")
-            self.save_state(state)
-            print(f"Success. Total posts: {state['post_count']}")
-        else:
-            print("Publish failed")
+            ok = self.post_to_linkedin(final_text)
+            if ok:
+                state["post_count"] = state.get("post_count", 0) + 1
+                state["last_post_date"] = datetime.now().strftime("%Y-%m-%d")
+                self.save_state(state)
+                print(f"Success. Total posts: {state['post_count']}")
+            else:
+                print("Publish failed")
+        except RuntimeError as e:
+            print(str(e))
+            return
 
 
 if __name__ == "__main__":
