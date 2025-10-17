@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
-LinkedIn AI Agent — quality-focused version
+LinkedIn AI Agent — quality-focused version (stable length + clean hashtags)
 
-Key improvements:
-- Punctuation & spacing normalization.
-- Removes "As a ..." openers and buzzwords.
-- Stops repeating the "Start with one use case..." playbook.
-- Picks only relevant hashtags (no brand tags unless mentioned).
-- Forces deep publisher links (no Google News); otherwise posts linkless.
-- Quality gate (length, sentence count, hashtag placement, link checks).
-- Optional delay skip via SKIP_DELAY=1 or DISABLE_DELAY=1 for CI/manual runs.
-- Optional REQUIRE_LINK=1 to require a publisher link when available.
-- Optional ABORT_IF_NO_LINK=1 to abort posting if no deep link is found.
-- Final expansion pass guarantees MIN_WORDS even on local fallback (no API).
+What’s new in this build:
+- Strips BOTH '#Tag' and 'hashtag#Tag' variants anywhere in the body.
+- Expands the BODY FIRST (before hashtags), then regenerates hashtags.
+- Guarantees MIN_WORDS on the body even if models return short text (pure-Python pad).
+- Keeps hashtags as a final block; QC checks enforce it.
+- Keeps stronger deep-link resolver; broader news scan.
+- ENV knobs: SKIP_DELAY / DISABLE_DELAY / REQUIRE_LINK / ABORT_IF_NO_LINK.
 """
 
 import os
@@ -78,9 +74,9 @@ class LinkedInAIAgent:
     }
     BANNED_BRAND_TAGS = {"#paypal", "#visa", "#mastercard", "#stripe", "#adyen"}
 
-    # Length controls
-    MIN_WORDS = 150       # desired floor
-    TARGET_HIGH = 190     # soft upper target for expansion
+    # Length controls (apply to BODY ONLY; hashtags excluded)
+    MIN_WORDS = 150
+    TARGET_HIGH = 190
 
     def __init__(self) -> None:
         self.linkedin_token = os.getenv("LINKEDIN_ACCESS_TOKEN", "").strip()
@@ -444,12 +440,10 @@ class LinkedInAIAgent:
             raw = (it.get("link") or "").strip()
             if not raw:
                 continue
-            # Direct publisher link?
             if not is_google_news(raw):
                 parsed = urlparse(raw)
                 if parsed.scheme.startswith("http") and parsed.netloc and parsed.path and parsed.path != "/":
                     return raw
-            # Resolve Google redirect via HEAD, then GET
             try:
                 h = {"User-Agent": "curl/8"}
                 r = requests.head(raw, allow_redirects=True, timeout=10, headers=h)
@@ -539,8 +533,8 @@ class LinkedInAIAgent:
             return None
 
         attempts = [
-            {"api": "v1", "model": "gemini-2.5-flash", "keep": 3, "max_out": 1200},
-            {"api": "v1", "model": "gemini-2.0-flash", "keep": 3, "max_out": 900},
+            {"api": "v1", "model": "gemini-2.5-flash", "keep": 3, "max_out": 2000},
+            {"api": "v1", "model": "gemini-2.0-flash", "keep": 3, "max_out": 2000},
         ]
         headers = {"Content-Type": "application/json"}
 
@@ -605,7 +599,6 @@ class LinkedInAIAgent:
         prompt = (
             "Write a LinkedIn post from a senior sales leader in tech/fintech who favors partnerships. "
             f"Tone: {tone_line}. Topic: {topic_key.replace('_', ' ')}. Structure: {structures.get(style, 'playbook')}.\n\n"
-            "Requirements:\n"
             f"- {self.MIN_WORDS} to 220 words. Vary sentence length and rhythm.\n"
             "- Direct, practical, human. Avoid buzzwords. No generic openers. No em dashes. No semicolons.\n"
             "- End with exactly 3 relevant hashtags on the last line.\n"
@@ -616,7 +609,7 @@ class LinkedInAIAgent:
 
         headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
         body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.7, "max_tokens": 520}
+                "temperature": 0.7, "max_tokens": 2000}
         try:
             r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=45)
             if r.status_code != 200:
@@ -631,68 +624,73 @@ class LinkedInAIAgent:
     # -------------------------------
     # Refinement passes
     # -------------------------------
-    def expand_if_short(self, text: str) -> str:
-        """If text shorter than MIN_WORDS, expand toward TARGET_HIGH without adding hashtags."""
-        if not text or self.word_count(text) >= self.MIN_WORDS:
-            return text
+    def _strip_hashtags_anywhere(self, text: str) -> str:
+        """Remove inline hashtags including 'hashtag#Word' variants."""
+        # remove lines that are hashtag blocks
+        lines = [ln for ln in text.splitlines() if not re.fullmatch(r'\s*(#\w+\s*){2,}\s*', ln.strip())]
+        text = "\n".join(lines)
+        # strip inline '#word' and 'hashtag#word'
+        text = re.sub(r'(?<!\w)#\w+', "", text)
+        text = re.sub(r'\bhashtag#\w+\b', "", text, flags=re.IGNORECASE)
+        # normalize leftover spacing
+        text = re.sub(r'\s{2,}', ' ', text)
+        return text.strip()
+
+    def expand_body_if_short(self, body: str) -> str:
+        """Expand BODY ONLY (no hashtags inside). Try model; then guarantee locally."""
+        if not body or self.word_count(body) >= self.MIN_WORDS:
+            return body
+
+        # 1) Try model-based expansion
         prompt = (
-            "Expand and refine the LinkedIn post to approximately "
-            f"{self.MIN_WORDS}-{self.TARGET_HIGH} words. Keep the same ideas, facts, and any URL. "
+            "Expand and refine this LinkedIn post body to approximately "
+            f"{self.MIN_WORDS}-{self.TARGET_HIGH} words. Keep the same ideas and any URL. "
             "Add one concrete example or small detail. Avoid hype. "
-            "No em dashes. No semicolons. End with the existing hashtags line if present; "
-            "if not present, do not add hashtags.\n\nPost:\n" + text
+            "No em dashes. No semicolons. Do NOT add hashtags.\n\n"
+            f"Body:\n{body}"
         )
         try:
             if self.gemini_key:
                 url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
-                body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 480}}
+                body_req = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2000}}
                 r = requests.post(f"{url}?key={self.gemini_key}", headers={"Content-Type": "application/json"},
-                                  json=body, timeout=35)
+                                  json=body_req, timeout=35)
                 if r.status_code == 200:
                     expanded = self._extract_text_from_gemini(r.json())
                     if expanded:
-                        return self.enforce_style_rules(self.debuzz(expanded))
-            if self.openai_key:
+                        body = self.enforce_style_rules(self.debuzz(expanded))
+            elif self.openai_key:
                 headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-                body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.3, "max_tokens": 480}
+                body_req = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.3, "max_tokens": 2000}
                 r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
-                                  json=body, timeout=35)
+                                  json=body_req, timeout=35)
                 if r.status_code == 200:
                     expanded = r.json()["choices"][0]["message"]["content"]
                     if expanded:
-                        return self.enforce_style_rules(self.debuzz(expanded))
+                        body = self.enforce_style_rules(self.debuzz(expanded))
         except Exception:
             pass
-        return text
 
-    def _local_expand_to_min(self, text: str) -> str:
-        """Guaranteed expansion to >= MIN_WORDS without calling any API."""
-        if not text:
-            return text
-        wc = self.word_count(text)
-        if wc >= self.MIN_WORDS:
-            return text
-
-        pads = [
-            " Outline the owner, the metric, and the review cadence so decisions are fast and visible.",
-            " Share one recent example with baseline, change, and the next step so progress compounds.",
-            " Remove one handoff that creates rework. Add one alert that prevents silent failure.",
-            " Write down the ‘stop conditions’ so automation exits cleanly and humans re-enter with context.",
-            " Close the loop by publishing results weekly. Make it boring, repeatable, and easy to copy.",
-        ]
-        i = 0
-        while wc < self.MIN_WORDS and i < len(pads):
-            if not text.endswith(('.', '!', '?')):
-                text = text.rstrip() + "."
-            text += pads[i]
-            wc = self.word_count(text)
-            i += 1
-
-        if wc < self.MIN_WORDS:
-            text += " For example, pick one flow, set a baseline, and publish a two-week improvement log."
-        return text
+        # 2) Pure-Python guarantee (pads) if still short
+        if self.word_count(body) < self.MIN_WORDS:
+            pads = [
+                " Outline the owner, the metric, and the review cadence so decisions are fast and visible.",
+                " Share one recent example with a baseline, the change you observed, and the next step so progress compounds.",
+                " Remove one handoff that creates rework. Add one alert that prevents silent failure in production.",
+                " Write down the ‘stop conditions’ so automation exits cleanly and humans re-enter with context.",
+                " Close the loop by publishing results weekly. Make it boring, repeatable, and easy to copy.",
+            ]
+            i = 0
+            while self.word_count(body) < self.MIN_WORDS and i < len(pads):
+                if not self.ends_cleanly(body):
+                    body = body.rstrip() + "."
+                body += pads[i]
+                i += 1
+            if self.word_count(body) < self.MIN_WORDS:
+                body += " For example, pick one flow, set a baseline, and publish a two-week improvement log."
+        return body
 
     def polish_with_model(self, text: str) -> str:
         if not text:
@@ -706,20 +704,20 @@ class LinkedInAIAgent:
         try:
             if self.gemini_key:
                 url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent"
-                body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 320}}
+                body_req = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2000}}
                 r = requests.post(f"{url}?key={self.gemini_key}", headers={"Content-Type": "application/json"},
-                                  json=body, timeout=35)
+                                  json=body_req, timeout=35)
                 if r.status_code == 200:
                     edited = self._extract_text_from_gemini(r.json())
                     if edited:
                         return self.enforce_style_rules(self.debuzz(edited))
             if self.openai_key:
                 headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-                body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.2, "max_tokens": 320}
+                body_req = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.2, "max_tokens": 2000}
                 r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
-                                  json=body, timeout=35)
+                                  json=body_req, timeout=35)
                 if r.status_code == 200:
                     edited = r.json()["choices"][0]["message"]["content"]
                     if edited:
@@ -829,22 +827,30 @@ class LinkedInAIAgent:
             text = re.sub(p, "", text, flags=re.IGNORECASE | re.DOTALL)
         return re.sub(r"\s{2,}", " ", text).strip()
 
-    def sanitize_and_finalize(self, body: str, topic_key: str, include_link: bool,
-                              news_items: List[dict], state: dict) -> str:
-        lines = [ln for ln in body.splitlines() if not re.fullmatch(r'\s*(#\w+\s*){2,}\s*', ln.strip())]
-        body = "\n".join(lines)
-        body = re.sub(r'(?<!\w)#\w+', "", body)
+    def assemble_post(self, raw_body: str, topic_key: str, include_link: bool,
+                      news_items: List[dict], state: dict) -> str:
+        """
+        Full pipeline:
+        1) Strip any hashtags in the body (including 'hashtag#').
+        2) Style clean + debuzz.
+        3) Deduplicate sentences + ensure terminal punctuation.
+        4) Inject opener/closer.
+        5) Attach deep link (if allowed & found) but no hashtags yet.
+        6) Expand BODY (+link) to MIN_WORDS.
+        7) Rebuild hashtags from expanded body; append as final block.
+        """
+        # 1) strip any hashtags inside
+        body = self._strip_hashtags_anywhere(raw_body)
 
+        # 2) style clean
         body = self.enforce_style_rules(self.debuzz(body)).strip()
 
-        m = re.search(r'(^|\n)\s*(#\w+(?:\s+#\w+){1,})\s*$', body, flags=re.IGNORECASE | re.MULTILINE)
-        if m:
-            body = body[: m.start()].rstrip()
-
+        # 3) dedupe + end cleanly
         body = self.dedupe_sentences(body)
         if not self.ends_cleanly(body):
             body = body.rstrip(' "\n') + "."
 
+        # 4) inject opener/closer
         body, closer = self.inject_open_close(body, state)
         if not self.ends_cleanly(body):
             body += " "
@@ -852,6 +858,7 @@ class LinkedInAIAgent:
         if not self.ends_cleanly(body):
             body += "."
 
+        # 5) link (no hashtags yet)
         link_line = ""
         if include_link:
             good = self.pick_publisher_link(news_items)
@@ -859,33 +866,41 @@ class LinkedInAIAgent:
                 link_line = f"\n\n{good}"
             elif os.getenv("ABORT_IF_NO_LINK") == "1":
                 raise RuntimeError("ABORT_IF_NO_LINK=1 and no deep link found.")
+        body_plus_link = body + link_line
 
-        tags = self.curated_hashtags(topic_key, body, news_items, state)
-        hashtags_line = f"\n\n{tags}" if tags else ""
+        # 6) expand BODY (+link) to MIN_WORDS
+        expanded = self.expand_body_if_short(body_plus_link)
 
-        final_text = body + link_line + hashtags_line
-
-        # Try model-based expansion first; if it fails, guarantee locally
-        final_text = self.expand_if_short(final_text)
-        final_text = self._local_expand_to_min(final_text)
+        # 7) rebuild hashtags from EXPANDED body
+        tags = self.curated_hashtags(topic_key, expanded, news_items, state)
+        final_text = expanded + (f"\n\n{tags}" if tags else "")
 
         return self.enforce_style_rules(self.debuzz(final_text)).strip()
 
     def quality_gate(self, text: str, include_link: bool) -> Tuple[bool, str]:
         if not text:
             return False, "empty"
-        wc = self.word_count(text)
+
+        # Split body vs hashtags for accurate length check
+        lines = [l for l in text.splitlines() if l.strip()]
+        hashtags_line = ""
+        if lines and re.fullmatch(r"(#\w+\s*){2,}", lines[-1].strip()):
+            hashtags_line = lines[-1]
+        body_only = text
+        if hashtags_line:
+            body_only = text[: text.rfind(hashtags_line)].rstrip()
+
+        wc = self.word_count(body_only)
         if wc < self.MIN_WORDS:
             return False, f"too short ({wc} words)"
         if wc > 220:
             return False, f"too long ({wc} words)"
-        if len(re.findall(r"[.!?]", text)) < 3:
+        if len(re.findall(r"[.!?]", body_only)) < 3:
             return False, "too few sentences"
 
-        lines = [l for l in text.splitlines() if l.strip()]
-        if lines:
-            last = lines[-1].strip()
-            if "#" in text and not re.fullmatch(r"(#\w+\s*){2,}", last):
+        # hashtags must be final block if present
+        if "#" in text:
+            if not hashtags_line:
                 return False, "hashtags not at end as block"
 
         if include_link and "news.google.com" in text:
@@ -998,7 +1013,7 @@ class LinkedInAIAgent:
             post_body = self._strip_repeated_playbook(post_body)
             post_body = self.polish_with_model(post_body)
 
-            final_text = self.sanitize_and_finalize(post_body, topic_key, include_link, news_items, state)
+            final_text = self.assemble_post(post_body, topic_key, include_link, news_items, state)
 
             # First quality gate
             ok_q, reason = self.quality_gate(final_text, include_link)
@@ -1006,7 +1021,7 @@ class LinkedInAIAgent:
                 print(f"Quality gate failed: {reason}. Falling back to local compose.")
                 fallback = self.local_compose(topic_key)
                 fallback = self.polish_with_model(fallback)
-                final_text = self.sanitize_and_finalize(fallback, topic_key, False, news_items, state)
+                final_text = self.assemble_post(fallback, topic_key, include_link=False, news_items=news_items, state=state)
 
                 # Second/Final quality gate — do NOT post if still failing
                 ok_q2, reason2 = self.quality_gate(final_text, include_link=False)
