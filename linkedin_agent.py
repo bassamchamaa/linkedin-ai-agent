@@ -12,9 +12,34 @@ import time
 # Utility: randomized post delay
 # -------------------------------
 def random_delay_minutes(min_minutes=0, max_minutes=120):
+    """
+    Sleep for a random amount of time unless we're running in CI or delay is disabled.
+
+    Skips sleeping if any of the following are set:
+      - DISABLE_DELAY=1
+      - CI=true (set automatically in GitHub Actions)
+      - GITHUB_ACTIONS=true (set automatically in GitHub Actions)
+
+    Optional local overrides (when NOT in CI):
+      - POST_DELAY_MIN / POST_DELAY_MAX to control the window.
+    """
+    if os.getenv("DISABLE_DELAY") == "1" or os.getenv("CI") or os.getenv("GITHUB_ACTIONS"):
+        print("CI detected or DISABLE_DELAY=1 — skipping random delay.")
+        return
+
+    try:
+        min_minutes = int(os.getenv("POST_DELAY_MIN", min_minutes))
+        max_minutes = int(os.getenv("POST_DELAY_MAX", max_minutes))
+    except ValueError:
+        # Fall back to given defaults if overrides are bad
+        pass
+
+    if max_minutes <= 0:
+        print("Delay disabled (POST_DELAY_MAX <= 0).")
+        return
+
     delay_seconds = random.randint(min_minutes * 60, max_minutes * 60)
-    delay_minutes = delay_seconds / 60
-    print(f"Random delay: waiting {delay_minutes:.1f} minutes before posting...")
+    print(f"Random delay: waiting {delay_seconds/60:.1f} minutes before posting...")
     time.sleep(delay_seconds)
 
 
@@ -245,11 +270,10 @@ class LinkedInAIAgent:
         # Remove "As a ..." opener
         text = re.sub(r"^\s*As a [^.!\n]+[, ]+", "", text, flags=re.IGNORECASE)
         # Strip stray opening quote if unmatched
-        if text.count('"') % 2 == 1 and text.strip().startswith('"'):
+        if text.count('"') % 2 == 1 and text.strip().startsWith('"'):
             text = text.lstrip('"').lstrip()
         # Collapse whitespace
         text = re.sub(r"[ \t]{2,}", " ", text)
-        # Avoid double hashtags line inside body
         return text.strip()
 
     def debuzz(self, text: str) -> str:
@@ -672,7 +696,10 @@ class LinkedInAIAgent:
         random.shuffle(candidates)
         chosen = None
         for i in range(min(12, len(candidates))):
-            trial = " ".join(candidates[i:i+3]) if len(candidates[i:i+3]) >= 3 else None
+            trial_tags = candidates[i:i+3]
+            if len(trial_tags) < 3:
+                break
+            trial = " ".join(trial_tags)
             if trial and trial.lower() not in recent_sets:
                 chosen = trial
                 break
@@ -838,7 +865,7 @@ class LinkedInAIAgent:
         if not self.should_post_today(state):
             return
 
-        # Randomize time in window
+        # Randomize time in window (skipped in CI by DISABLE_DELAY/CI/GITHUB_ACTIONS)
         random_delay_minutes(min_minutes=0, max_minutes=120)
 
         topic_key, state = self.get_next_topic(state)
