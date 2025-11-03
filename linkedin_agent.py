@@ -603,44 +603,10 @@ class LinkedInAIAgent:
         tone_line = ("Tone: inspirational with restraint, never chest-beating."
                      if tone == "inspirational" else "Tone: thought leadership, specific and useful.")
 
-        prompt = (
-            f"{persona} {tone_line} Topic: {topic_key.replace('_', ' ')}. "
-            f"{structures.get(style, 'Structure: 1) context, 2) steps, 3) risk, 4) CTA.')}\n\n"
-            "Requirements:\n"
-            f"- Strictly {WORD_MIN}–{WORD_MAX} words. Vary sentence length and rhythm.\n"
-            "- Avoid buzzwords. No generic openers like 'As a'. No em dashes. No semicolons.\n"
-            "- Use a clean, confident, human voice. Keep it practical.\n"
-            "- End with exactly 3 relevant hashtags on a final separate line.\n"
-            f"- {link_instruction}\n\n"
-            f"Recent items to anchor context:\n{news_context}\n\n"
-            "Return only the post body with no preface, no headers, no quotes, and no markdown fences."
-        )
-        return prompt
+from linkedin_agent_core import LinkedInAIAgent
 
-    def _extract_text_from_gemini(self, payload: dict) -> str | None:
-        try:
-            cand = payload["candidates"][0]
-        except Exception:
-            return None
-        content = cand.get("content")
-        if isinstance(content, dict):
-            parts = content.get("parts")
-            if isinstance(parts, list):
-                texts = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
-                if any(texts):
-                    return "\n".join(t for t in texts if t)
-        if isinstance(content, list):
-            texts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
-            if any(texts):
-                return "\n".join(t for t in texts if t)
-        if "text" in cand:
-            return cand["text"]
-        return None
+__all__ = ["LinkedInAIAgent", "main"]
 
-    def generate_post_with_gemini(self, topic_key: str, news_items: List[dict],
-                                  include_link: bool, tone: str, style: str) -> str | None:
-        if not self.gemini_key:
-            return None
 
         # Use models commonly available on free tier
         attempts = [
