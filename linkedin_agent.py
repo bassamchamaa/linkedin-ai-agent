@@ -701,6 +701,33 @@ class LinkedInAIAgent:
                 continue
         return None
 
+    def _call_openai_completion(self, prompt: str, temperature: float, max_completion_tokens: int) -> str | None:
+        """Send a chat completion request to GPT-5 Nano with consistent parameters."""
+        if not self.openai_key:
+            return None
+
+        headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
+        body = {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_completion_tokens": max_completion_tokens,
+        }
+        try:
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=body,
+                timeout=45,
+            )
+            if response.status_code != 200:
+                print(f"OpenAI error {response.status_code}: {response.text[:400]}")
+                return None
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as exc:
+            print(f"OpenAI call failed: {exc}")
+            return None
+
     def generate_post_with_openai(self, topic_key: str, news_items: List[dict],
                                   include_link: bool, tone: str, style: str) -> str | None:
         if not self.openai_key:
@@ -754,6 +781,7 @@ class LinkedInAIAgent:
         except Exception as e:
             print(f"OpenAI call failed: {e}")
             return None
+        return self.enforce_style_rules(self.debuzz(text))
 
     # -------------------------------
     # Refinement & padding passes
