@@ -737,6 +737,7 @@ class LinkedInAIAgent:
         )
 
         headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
+   python
         body = {
             "model": "gpt-5-nano",
             "messages": [{"role": "user", "content": prompt}],
@@ -781,12 +782,14 @@ class LinkedInAIAgent:
                         return self.enforce_style_rules(self.debuzz(expanded))
             if self.openai_key:
                 headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-                body = {
-                    "model": "gpt-5-nano",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,
-                    "max_completion_tokens": 360,
-                }
+   ```python
+        body = {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_completion_tokens": 520,
+        }
+   ```
                 r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
                                   json=body, timeout=35)
                 if r.status_code == 200:
@@ -860,12 +863,14 @@ class LinkedInAIAgent:
                         return self.enforce_style_rules(self.debuzz(edited))
             if self.openai_key:
                 headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-                body = {
-                    "model": "gpt-5-nano",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.2,
-                    "max_completion_tokens": 320,
-                }
+   ```python
+        body = {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_completion_tokens": 520,
+        }
+   ```
                 r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
                                   json=body, timeout=35)
                 if r.status_code == 200:
