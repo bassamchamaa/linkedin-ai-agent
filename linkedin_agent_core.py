@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 LinkedIn AI Agent
+=================
 
 Generates and posts LinkedIn updates on a defined cadence for a
 "senior tech/fintech sales leader" persona. Posts must:
@@ -16,10 +17,26 @@ The agent supports Gemini 2.5 Flash and GPT-5 Nano models, enforces
 style constraints, and stores lightweight state in ``agent_state.json``.
 """
 
-from linkedin_agent_core import LinkedInAIAgent
+import os
+import json
+import re
+import random
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs, unquote
+import xml.etree.ElementTree as ET
+import requests
+import time
+from typing import Tuple, List, Dict
+from html import unescape  # NEW
 
-__all__ = ["LinkedInAIAgent"]
+# -------------------------------
+# Configuration
+# -------------------------------
+WORD_MIN = 100
+WORD_MAX = 150
 
+# Robust final-line hashtag matcher (exactly one line, >=3 tags)
+HASHTAG_BLOCK_RE = re.compile(r"^(?:#\w+(?:\s+#\w+){2,})$", re.IGNORECASE)
 
 
 # -------------------------------
@@ -746,23 +763,8 @@ class LinkedInAIAgent:
             "Return only the post body with no preface, no headers, no quotes, and no markdown fences."
         )
 
-        headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-   python
-        body = {
-            "model": "gpt-5-nano",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7,
-            "max_completion_tokens": 520,
-        }
-        try:
-            r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=45)
-            if r.status_code != 200:
-                print(f"OpenAI error {r.status_code}: {r.text[:400]}")
-                return None
-            text = r.json()["choices"][0]["message"]["content"]
-            return self.enforce_style_rules(self.debuzz(text))
-        except Exception as e:
-            print(f"OpenAI call failed: {e}")
+        text = self._call_openai_completion(prompt, temperature=0.7, max_completion_tokens=520)
+        if not text:
             return None
         return self.enforce_style_rules(self.debuzz(text))
 
@@ -792,21 +794,9 @@ class LinkedInAIAgent:
                     if expanded:
                         return self.enforce_style_rules(self.debuzz(expanded))
             if self.openai_key:
-                headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-   ```python
-        body = {
-            "model": "gpt-5-nano",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7,
-            "max_completion_tokens": 520,
-        }
-   ```
-                r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
-                                  json=body, timeout=35)
-                if r.status_code == 200:
-                    expanded = r.json()["choices"][0]["message"]["content"]
-                    if expanded:
-                        return self.enforce_style_rules(self.debuzz(expanded))
+                expanded = self._call_openai_completion(prompt, temperature=0.3, max_completion_tokens=360)
+                if expanded:
+                    return self.enforce_style_rules(self.debuzz(expanded))
         except Exception:
             pass
         return text
@@ -873,21 +863,9 @@ class LinkedInAIAgent:
                     if edited:
                         return self.enforce_style_rules(self.debuzz(edited))
             if self.openai_key:
-                headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-   ```python
-        body = {
-            "model": "gpt-5-nano",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7,
-            "max_completion_tokens": 520,
-        }
-   ```
-                r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
-                                  json=body, timeout=35)
-                if r.status_code == 200:
-                    edited = r.json()["choices"][0]["message"]["content"]
-                    if edited:
-                        return self.enforce_style_rules(self.debuzz(edited))
+                edited = self._call_openai_completion(prompt, temperature=0.2, max_completion_tokens=320)
+                if edited:
+                    return self.enforce_style_rules(self.debuzz(edited))
         except Exception as e:
             print(f"Polish pass skipped due to error: {e}")
         return self.enforce_style_rules(self.debuzz(text))
@@ -1221,4 +1199,4 @@ class LinkedInAIAgent:
 
 
 if __name__ == "__main__":
-    main()
+    LinkedInAIAgent().run_weekly_post()
