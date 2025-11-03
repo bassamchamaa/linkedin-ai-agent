@@ -1069,61 +1069,6 @@ class LinkedInAIAgent:
             return False
 
     # -------------------------------
-    # Local compose fallback (≈110–140 words)
-    # -------------------------------
-    def local_compose(self, topic_key: str) -> str:
-        """Deterministic, in-depth fallback around 110–140 words, no hashtags, no link."""
-        themes = {
-            "tech_partnerships": {
-                "hook": "Great partnerships feel simple to customers because the hard work is invisible.",
-                "angle": "clarity of ownership and a shared metric.",
-                "example": "When we co-sold with a data platform, we published one KPI—‘activated accounts in 30 days’. Sales, CS, and the partner team met weekly on that number.",
-                "tip": "Define the milestone, expose it in both dashboards, and agree on the next experiment before the meeting ends."
-            },
-            "ai": {
-                "hook": "AI wins in the enterprise when it reduces time to value, not just cost.",
-                "angle": "narrow problems with clean data and visible owners.",
-                "example": "A claims triage bot cut backlog by 18% in six weeks because inputs were standardized and handoffs were scripted.",
-                "tip": "Pick one workflow, write the ‘before/after’ in plain English, and automate the boring middle first."
-            },
-            "payments": {
-                "hook": "Payments is a trust business. Speed and acceptance matter; proof beats promises.",
-                "angle": "instrumenting risk, auth rates, and time-to-first-settlement.",
-                "example": "A merchant moved retries to the network edge and lifted approvals by 140 bps without touching checkout.",
-                "tip": "Start with three dials: authorization rate, fraud loss, and settlement timing—publish them weekly."
-            },
-            "agentic_commerce": {
-                "hook": "Agentic commerce turns browsing into doing by removing decisions, not just clicks.",
-                "angle": "let the system propose the next best action with guardrails.",
-                "example": "A concierge bot pre-fills size and delivery constraints and surfaces two in-stock bundles; abandonment falls because the choice set is sane.",
-                "tip": "Autonomy needs constraints: budget, catalog, and escalation rules—write them down first."
-            },
-            "generative_ai": {
-                "hook": "Generative AI helps when inputs are reliable and edits are cheap.",
-                "angle": "tight loops with human accept/reject signals.",
-                "example": "Legal review cut drafting time by 35% using clause templates and a redline diff users could reject in one click.",
-                "tip": "Instrument acceptance rate and rework time; if they stall, fix the prompts or the data."
-            },
-            "ai_automations": {
-                "hook": "Automation shines when it owns the boring work and hands off the hard parts clearly.",
-                "angle": "routing exceptions with context, not tickets.",
-                "example": "Escalations included prior steps, inputs, and confidence; resolution time halved because rework disappeared.",
-                "tip": "Design the stop conditions first. Automation without an exit is a support queue."
-            },
-        }
-
-        d = themes.get(topic_key, themes["tech_partnerships"])
-        lines = [
-            d["hook"],
-            f"The lever is {d['angle']}",
-            d["example"],
-            d["tip"],
-            random.choice(INSIGHT_VARIATIONS),
-        ]
-        text = " ".join(lines)
-        return self.enforce_style_rules(self.debuzz(text))
-
-    # -------------------------------
     # Main run
     # -------------------------------
     def run_weekly_post(self) -> None:
@@ -1168,8 +1113,8 @@ class LinkedInAIAgent:
             print("Fallback to OpenAI")
             post_body = self.generate_post_with_openai(topic_key, news_items, include_link, tone, style)
         if not post_body:
-            print("Models failed, composing locally")
-            post_body = self.local_compose(topic_key)
+            print("Models failed; aborting run.")
+            return
 
         # Clean/shape
         post_body = self._strip_repeated_playbook(post_body)
@@ -1179,10 +1124,8 @@ class LinkedInAIAgent:
         # Gate quality
         ok_q, reason = self.quality_gate(final_text, include_link)
         if not ok_q:
-            print(f"Quality gate failed: {reason}. Falling back to local compose.")
-            fallback = self.local_compose(topic_key)
-            fallback = self.polish_with_model(fallback)
-            final_text = self.sanitize_and_finalize(fallback, topic_key, False, news_items, state)
+            print(f"Quality gate failed: {reason}. Aborting run.")
+            return
 
         print("\nGenerated post\n" + "-" * 60 + f"\n{final_text}\n" + "-" * 60)
 
