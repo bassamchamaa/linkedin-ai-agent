@@ -53,5 +53,6 @@ Environment flags:
 
 - Missing LinkedIn secrets or model keys trigger explicit console messages and the run exits without posting.
 - LinkedIn API failures raise an error, ensuring the GitHub Action surfaces as failed for quick review.
+- If GitHub shows “This branch has conflicts that must be resolved,” pull the latest changes from `main` and merge or rebase them into your feature branch locally, resolve any conflict markers in files such as `linkedin_agent.py`, and push the updated branch before reopening the pull request.
 
 Happy posting! 🎯
