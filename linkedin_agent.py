@@ -763,8 +763,23 @@ class LinkedInAIAgent:
             "Return only the post body with no preface, no headers, no quotes, and no markdown fences."
         )
 
-        text = self._call_openai_completion(prompt, temperature=0.7, max_completion_tokens=520)
-        if not text:
+        headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
+   python
+        body = {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_completion_tokens": 520,
+        }
+        try:
+            r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=45)
+            if r.status_code != 200:
+                print(f"OpenAI error {r.status_code}: {r.text[:400]}")
+                return None
+            text = r.json()["choices"][0]["message"]["content"]
+            return self.enforce_style_rules(self.debuzz(text))
+        except Exception as e:
+            print(f"OpenAI call failed: {e}")
             return None
         return self.enforce_style_rules(self.debuzz(text))
 
@@ -794,9 +809,21 @@ class LinkedInAIAgent:
                     if expanded:
                         return self.enforce_style_rules(self.debuzz(expanded))
             if self.openai_key:
-                expanded = self._call_openai_completion(prompt, temperature=0.3, max_completion_tokens=360)
-                if expanded:
-                    return self.enforce_style_rules(self.debuzz(expanded))
+                headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
+   ```python
+        body = {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_completion_tokens": 520,
+        }
+   ```
+                r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
+                                  json=body, timeout=35)
+                if r.status_code == 200:
+                    expanded = r.json()["choices"][0]["message"]["content"]
+                    if expanded:
+                        return self.enforce_style_rules(self.debuzz(expanded))
         except Exception:
             pass
         return text
@@ -863,9 +890,21 @@ class LinkedInAIAgent:
                     if edited:
                         return self.enforce_style_rules(self.debuzz(edited))
             if self.openai_key:
-                edited = self._call_openai_completion(prompt, temperature=0.2, max_completion_tokens=320)
-                if edited:
-                    return self.enforce_style_rules(self.debuzz(edited))
+                headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
+   ```python
+        body = {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_completion_tokens": 520,
+        }
+   ```
+                r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
+                                  json=body, timeout=35)
+                if r.status_code == 200:
+                    edited = r.json()["choices"][0]["message"]["content"]
+                    if edited:
+                        return self.enforce_style_rules(self.debuzz(edited))
         except Exception as e:
             print(f"Polish pass skipped due to error: {e}")
         return self.enforce_style_rules(self.debuzz(text))
