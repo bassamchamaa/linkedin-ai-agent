@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-LinkedIn AI Agent — quality-focused (100–150 words)
+LinkedIn AI Agent
+=================
 
-What this version fixes:
-- Enforces 100–150 words (WORD_MIN/WORD_MAX).
-- Strips model prefaces (“Here’s the refined post…”, code fences, Draft: etc.).
-- Better hashtag validation; always rebuilds the hashtag line at the end.
-- Removes inline stray hashtags and odd 'hashtag#Tag' artifacts.
-- Smarter Gemini handling: retries when finishReason=MAX_TOKENS with bigger maxOutputTokens.
-- If REQUIRE_LINK=1, retries news fetch once with an alternate query to find a deep publisher link.
-- Final pad-to-min if still short (adds one crisp sentence), then quality gate.
-- NEW: PYMNTS.com scraper. Set NEWS_SOURCE=pymnts to prefer PYMNTS globally; it is also auto-used for the 'payments' topic.
+Generates and posts LinkedIn updates on a defined cadence for a
+"senior tech/fintech sales leader" persona. Posts must:
+
+* Land between 100 and 150 words.
+* Rotate across predefined topic buckets and prompt structures.
+* Prefer PYMNTS.com coverage for payments topics, otherwise fall back to
+  Google News RSS with publisher link extraction.
+* End with a clean publisher link (when available) and exactly three
+  curated hashtags on the final line.
+
+The agent supports Gemini 2.5 Flash and GPT-5 Nano models, enforces
+style constraints, and stores lightweight state in ``agent_state.json``.
 """
 
 import os
@@ -697,6 +701,33 @@ class LinkedInAIAgent:
                 continue
         return None
 
+    def _call_openai_completion(self, prompt: str, temperature: float, max_completion_tokens: int) -> str | None:
+        """Send a chat completion request to GPT-5 Nano with consistent parameters."""
+        if not self.openai_key:
+            return None
+
+        headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
+        body = {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_completion_tokens": max_completion_tokens,
+        }
+        try:
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=body,
+                timeout=45,
+            )
+            if response.status_code != 200:
+                print(f"OpenAI error {response.status_code}: {response.text[:400]}")
+                return None
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as exc:
+            print(f"OpenAI call failed: {exc}")
+            return None
+
     def generate_post_with_openai(self, topic_key: str, news_items: List[dict],
                                   include_link: bool, tone: str, style: str) -> str | None:
         if not self.openai_key:
@@ -732,19 +763,10 @@ class LinkedInAIAgent:
             "Return only the post body with no preface, no headers, no quotes, and no markdown fences."
         )
 
-        headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-        body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.7, "max_tokens": 520}
-        try:
-            r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=45)
-            if r.status_code != 200:
-                print(f"OpenAI error {r.status_code}: {r.text[:400]}")
-                return None
-            text = r.json()["choices"][0]["message"]["content"]
-            return self.enforce_style_rules(self.debuzz(text))
-        except Exception as e:
-            print(f"OpenAI call failed: {e}")
+        text = self._call_openai_completion(prompt, temperature=0.7, max_completion_tokens=520)
+        if not text:
             return None
+        return self.enforce_style_rules(self.debuzz(text))
 
     # -------------------------------
     # Refinement & padding passes
@@ -772,15 +794,9 @@ class LinkedInAIAgent:
                     if expanded:
                         return self.enforce_style_rules(self.debuzz(expanded))
             if self.openai_key:
-                headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-                body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.3, "max_tokens": 360}
-                r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
-                                  json=body, timeout=35)
-                if r.status_code == 200:
-                    expanded = r.json()["choices"][0]["message"]["content"]
-                    if expanded:
-                        return self.enforce_style_rules(self.debuzz(expanded))
+                expanded = self._call_openai_completion(prompt, temperature=0.3, max_completion_tokens=360)
+                if expanded:
+                    return self.enforce_style_rules(self.debuzz(expanded))
         except Exception:
             pass
         return text
@@ -804,6 +820,27 @@ class LinkedInAIAgent:
         text = (text.rstrip() + " " + sentence).strip()
         return text
 
+    def trim_to_max_words(self, text: str, max_words: int) -> str:
+        if self.word_count(text) <= max_words:
+            return text.strip()
+
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        trimmed = list(sentences)
+        while trimmed and self.word_count(" ".join(trimmed)) > max_words:
+            trimmed = trimmed[:-1]
+
+        if trimmed:
+            candidate = " ".join(trimmed).strip()
+            if not self.ends_cleanly(candidate):
+                candidate = candidate.rstrip(' "\n') + "."
+            return candidate
+
+        words = text.split()
+        candidate = " ".join(words[:max_words]).rstrip(', ')
+        if not candidate.endswith(('.', '!', '?')):
+            candidate = candidate + '.'
+        return candidate.strip()
+
     def polish_with_model(self, text: str) -> str:
         if not text:
             return text
@@ -826,15 +863,9 @@ class LinkedInAIAgent:
                     if edited:
                         return self.enforce_style_rules(self.debuzz(edited))
             if self.openai_key:
-                headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-                body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.2, "max_tokens": 320}
-                r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
-                                  json=body, timeout=35)
-                if r.status_code == 200:
-                    edited = r.json()["choices"][0]["message"]["content"]
-                    if edited:
-                        return self.enforce_style_rules(self.debuzz(edited))
+                edited = self._call_openai_completion(prompt, temperature=0.2, max_completion_tokens=320)
+                if edited:
+                    return self.enforce_style_rules(self.debuzz(edited))
         except Exception as e:
             print(f"Polish pass skipped due to error: {e}")
         return self.enforce_style_rules(self.debuzz(text))
@@ -979,8 +1010,12 @@ class LinkedInAIAgent:
         if not self.ends_cleanly(body):
             body += "."
 
-        # Last-mile pad if still short
+        # Last-mile pad if still short and trim if needed
         body = self._pad_to_minimum(body, topic_key)
+        if self.word_count(body) > WORD_MAX:
+            body = self.trim_to_max_words(body, WORD_MAX)
+        if self.word_count(body) < WORD_MIN:
+            body = self._pad_to_minimum(body, topic_key)
 
         # Link (deep publisher only)
         link_line = ""
@@ -1008,23 +1043,44 @@ class LinkedInAIAgent:
         """Return (ok, reason) to decide if a post is publishable."""
         if not text:
             return False, "empty"
-        wc = self.word_count(text)
+
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines:
+            return False, "empty"
+
+        hashtag_line = ""
+        if lines and HASHTAG_BLOCK_RE.match(lines[-1]):
+            hashtag_line = lines.pop()
+            tags = hashtag_line.split()
+            if len(tags) != 3:
+                return False, "invalid hashtag count"
+        elif any("#" in l for l in lines):
+            return False, "hashtags not at end as block"
+
+        link_line = ""
+        if lines and re.match(r"^https?://", lines[-1], flags=re.IGNORECASE):
+            link_line = lines.pop()
+
+        body_text = " ".join(lines).strip()
+        if not body_text:
+            return False, "empty body"
+
+        wc = self.word_count(body_text)
         if wc < WORD_MIN:
             return False, f"too short ({wc} words)"
-        if wc > WORD_MAX + 20:
+        if wc > WORD_MAX:
             return False, f"too long ({wc} words)"
-        if len(re.findall(r"[.!?]", text)) < 3:
+        if len(re.findall(r"[.!?]", body_text)) < 3:
             return False, "too few sentences"
 
-        # hashtags must be a final block if present
-        lines = [l for l in text.splitlines() if l.strip()]
-        if "#" in text and lines:
-            last = lines[-1].strip()
-            if not HASHTAG_BLOCK_RE.match(last):
-                return False, "hashtags not at end as block"
+        if include_link:
+            if not link_line:
+                return False, "missing publisher link"
+            if "news.google.com" in link_line.lower():
+                return False, "google news link present"
+        elif link_line:
+            return False, "unexpected link line"
 
-        if include_link and "news.google.com" in text:
-            return False, "google news link present"
         return True, "ok"
 
     # -------------------------------
@@ -1069,67 +1125,17 @@ class LinkedInAIAgent:
             return False
 
     # -------------------------------
-    # Local compose fallback (≈110–140 words)
-    # -------------------------------
-    def local_compose(self, topic_key: str) -> str:
-        """Deterministic, in-depth fallback around 110–140 words, no hashtags, no link."""
-        themes = {
-            "tech_partnerships": {
-                "hook": "Great partnerships feel simple to customers because the hard work is invisible.",
-                "angle": "clarity of ownership and a shared metric.",
-                "example": "When we co-sold with a data platform, we published one KPI—‘activated accounts in 30 days’. Sales, CS, and the partner team met weekly on that number.",
-                "tip": "Define the milestone, expose it in both dashboards, and agree on the next experiment before the meeting ends."
-            },
-            "ai": {
-                "hook": "AI wins in the enterprise when it reduces time to value, not just cost.",
-                "angle": "narrow problems with clean data and visible owners.",
-                "example": "A claims triage bot cut backlog by 18% in six weeks because inputs were standardized and handoffs were scripted.",
-                "tip": "Pick one workflow, write the ‘before/after’ in plain English, and automate the boring middle first."
-            },
-            "payments": {
-                "hook": "Payments is a trust business. Speed and acceptance matter; proof beats promises.",
-                "angle": "instrumenting risk, auth rates, and time-to-first-settlement.",
-                "example": "A merchant moved retries to the network edge and lifted approvals by 140 bps without touching checkout.",
-                "tip": "Start with three dials: authorization rate, fraud loss, and settlement timing—publish them weekly."
-            },
-            "agentic_commerce": {
-                "hook": "Agentic commerce turns browsing into doing by removing decisions, not just clicks.",
-                "angle": "let the system propose the next best action with guardrails.",
-                "example": "A concierge bot pre-fills size and delivery constraints and surfaces two in-stock bundles; abandonment falls because the choice set is sane.",
-                "tip": "Autonomy needs constraints: budget, catalog, and escalation rules—write them down first."
-            },
-            "generative_ai": {
-                "hook": "Generative AI helps when inputs are reliable and edits are cheap.",
-                "angle": "tight loops with human accept/reject signals.",
-                "example": "Legal review cut drafting time by 35% using clause templates and a redline diff users could reject in one click.",
-                "tip": "Instrument acceptance rate and rework time; if they stall, fix the prompts or the data."
-            },
-            "ai_automations": {
-                "hook": "Automation shines when it owns the boring work and hands off the hard parts clearly.",
-                "angle": "routing exceptions with context, not tickets.",
-                "example": "Escalations included prior steps, inputs, and confidence; resolution time halved because rework disappeared.",
-                "tip": "Design the stop conditions first. Automation without an exit is a support queue."
-            },
-        }
-
-        d = themes.get(topic_key, themes["tech_partnerships"])
-        lines = [
-            d["hook"],
-            f"The lever is {d['angle']}",
-            d["example"],
-            d["tip"],
-            random.choice(INSIGHT_VARIATIONS),
-        ]
-        text = " ".join(lines)
-        return self.enforce_style_rules(self.debuzz(text))
-
-    # -------------------------------
     # Main run
     # -------------------------------
     def run_weekly_post(self) -> None:
         print("\n" + "=" * 60)
         print(f"LinkedIn AI Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("=" * 60 + "\n")
+
+        if not (self.gemini_key or self.openai_key):
+            return
+        if not (self.linkedin_token and self.person_urn):
+            return
 
         state = self.load_state()
         if not self.should_post_today(state):
@@ -1168,8 +1174,7 @@ class LinkedInAIAgent:
             print("Fallback to OpenAI")
             post_body = self.generate_post_with_openai(topic_key, news_items, include_link, tone, style)
         if not post_body:
-            print("Models failed, composing locally")
-            post_body = self.local_compose(topic_key)
+            raise RuntimeError("Unable to generate post with available models.")
 
         # Clean/shape
         post_body = self._strip_repeated_playbook(post_body)
@@ -1179,10 +1184,7 @@ class LinkedInAIAgent:
         # Gate quality
         ok_q, reason = self.quality_gate(final_text, include_link)
         if not ok_q:
-            print(f"Quality gate failed: {reason}. Falling back to local compose.")
-            fallback = self.local_compose(topic_key)
-            fallback = self.polish_with_model(fallback)
-            final_text = self.sanitize_and_finalize(fallback, topic_key, False, news_items, state)
+            raise RuntimeError(f"Quality gate failed: {reason}")
 
         print("\nGenerated post\n" + "-" * 60 + f"\n{final_text}\n" + "-" * 60)
 
@@ -1193,7 +1195,7 @@ class LinkedInAIAgent:
             self.save_state(state)
             print(f"Success. Total posts: {state['post_count']}")
         else:
-            print("Publish failed")
+            raise RuntimeError("Publish failed")
 
 
 if __name__ == "__main__":
