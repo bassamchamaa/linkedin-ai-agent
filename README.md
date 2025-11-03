@@ -53,6 +53,17 @@ Environment flags:
 
 - Missing LinkedIn secrets or model keys trigger explicit console messages and the run exits without posting.
 - LinkedIn API failures raise an error, ensuring the GitHub Action surfaces as failed for quick review.
-- If GitHub shows “This branch has conflicts that must be resolved,” pull the latest changes from `main` and merge or rebase them into your feature branch locally, resolve any conflict markers in files such as `linkedin_agent.py`, and push the updated branch before reopening the pull request.
+
+### Resolving “This branch has conflicts”
+
+When a pull request shows the yellow conflict banner, GitHub is telling you that `main` has changed since you opened your branch. Fix it locally with these steps:
+
+1. `git fetch origin` – make sure you have the latest `main` history.
+2. `git checkout <your-branch>` – switch back to the branch from the pull request.
+3. `git merge origin/main` (or `git rebase origin/main`) – bring the new commits into your branch.
+4. Open any files marked with conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), pick the correct code, and save.
+5. `git add <each-file>` once the conflicts are resolved, then `git commit` and `git push`.
+
+After the push the banner disappears and the PR can be merged. You can also use GitHub’s “Resolve conflicts” editor if you prefer to handle steps 3–5 in the browser.
 
 Happy posting! 🎯
