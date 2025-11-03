@@ -737,8 +737,13 @@ class LinkedInAIAgent:
         )
 
         headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-        body = {"model": "gpt-5-nano", "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.7, "max_tokens": 520}
+   python
+        body = {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_completion_tokens": 520,
+        }
         try:
             r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=45)
             if r.status_code != 200:
@@ -777,8 +782,14 @@ class LinkedInAIAgent:
                         return self.enforce_style_rules(self.debuzz(expanded))
             if self.openai_key:
                 headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-                body = {"model": "gpt-5-nano", "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.3, "max_tokens": 360}
+   ```python
+        body = {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_completion_tokens": 520,
+        }
+   ```
                 r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
                                   json=body, timeout=35)
                 if r.status_code == 200:
@@ -852,8 +863,14 @@ class LinkedInAIAgent:
                         return self.enforce_style_rules(self.debuzz(edited))
             if self.openai_key:
                 headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-                body = {"model": "gpt-5-nano", "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.2, "max_tokens": 320}
+   ```python
+        body = {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_completion_tokens": 520,
+        }
+   ```
                 r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers,
                                   json=body, timeout=35)
                 if r.status_code == 200:
@@ -1037,23 +1054,44 @@ class LinkedInAIAgent:
         """Return (ok, reason) to decide if a post is publishable."""
         if not text:
             return False, "empty"
-        wc = self.word_count(text)
+
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines:
+            return False, "empty"
+
+        hashtag_line = ""
+        if lines and HASHTAG_BLOCK_RE.match(lines[-1]):
+            hashtag_line = lines.pop()
+            tags = hashtag_line.split()
+            if len(tags) != 3:
+                return False, "invalid hashtag count"
+        elif any("#" in l for l in lines):
+            return False, "hashtags not at end as block"
+
+        link_line = ""
+        if lines and re.match(r"^https?://", lines[-1], flags=re.IGNORECASE):
+            link_line = lines.pop()
+
+        body_text = " ".join(lines).strip()
+        if not body_text:
+            return False, "empty body"
+
+        wc = self.word_count(body_text)
         if wc < WORD_MIN:
             return False, f"too short ({wc} words)"
         if wc > WORD_MAX:
             return False, f"too long ({wc} words)"
-        if len(re.findall(r"[.!?]", text)) < 3:
+        if len(re.findall(r"[.!?]", body_text)) < 3:
             return False, "too few sentences"
 
-        # hashtags must be a final block if present
-        lines = [l for l in text.splitlines() if l.strip()]
-        if "#" in text and lines:
-            last = lines[-1].strip()
-            if not HASHTAG_BLOCK_RE.match(last):
-                return False, "hashtags not at end as block"
+        if include_link:
+            if not link_line:
+                return False, "missing publisher link"
+            if "news.google.com" in link_line.lower():
+                return False, "google news link present"
+        elif link_line:
+            return False, "unexpected link line"
 
-        if include_link and "news.google.com" in text:
-            return False, "google news link present"
         return True, "ok"
 
     # -------------------------------
