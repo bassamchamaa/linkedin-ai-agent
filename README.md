@@ -1,44 +1,57 @@
 # LinkedIn AI Agent 🤖
 
-Automated LinkedIn posting for tech partnerships, AI, and payments content.
+Automated LinkedIn posting aligned to a **senior tech/fintech sales leader** persona. Posts draw from curated enterprise topics and news, maintain a clean 100–150 word format, and publish on a reliable cadence via GitHub Actions.
 
-## What It Does
+## Cadence & Workflow
 
-Posts **3 times per week** (Monday/Wednesday/Friday) to LinkedIn with:
-- Tech & Business Development Partnerships content
-- Cutting-edge AI insights
-- Fintech & Payments industry news
+- **Schedule:** Monday 7 AM ET, Wednesday 12 PM ET, Friday 7 AM ET (GitHub Actions cron).
+- **Workflow file:** `.github/workflows/linkedin-agent.yml` installs Python, runs `linkedin_agent.py`, and commits the state file after each run.
+- **Delay handling:** The script introduces a randomized delay locally, but the workflow sets `SKIP_DELAY=1` so CI executes immediately.
 
-All posts written from the perspective of a senior sales leader in tech/fintech with expertise in strategic partnerships.
+## What the Agent Produces
 
-## Features
+- Rotates through six topic buckets: tech partnerships, AI, payments, agentic commerce, generative AI, and AI automations.
+- Pulls recent coverage from PYMNTS.com (preferred for payments) or Google News RSS with publisher link extraction.
+- Applies one of five prompt structures (story, tactical, contrarian, data point, playbook) and alternates between “inspirational with restraint” and “thought leadership—specific and useful” tones.
+- Ensures posts stay between **100 and 150 words**, avoid “As a…” openers, em dashes, semicolons, and finish with exactly three curated hashtags on the final line. A deep publisher link is inserted ahead of the hashtags when available.
 
-✅ **Automatic topic rotation** - never posts same topic twice in a row  
-✅ **Mixed content** - 60% news-based, 40% thought leadership  
-✅ **Smart scheduling** - posts at peak engagement times in ET  
-✅ **100% free** - uses only free tiers  
-✅ **No maintenance** - runs automatically via GitHub Actions
+## Required Secrets
 
-## Posting Schedule
+Create these secrets in your GitHub repository settings:
 
-- **Monday**: 7-9 AM ET (early morning)
-- **Wednesday**: 12-1 PM ET (lunch hour)
-- **Friday**: 7-9 AM ET (Friday morning)
+| Secret | Purpose |
+| --- | --- |
+| `LINKEDIN_ACCESS_TOKEN` | LinkedIn REST API token with `w_member_social` scope. |
+| `LINKEDIN_PERSON_URN` | LinkedIn person identifier (without the `urn:li:person:` prefix). |
+| `GEMINI_API_KEY` | Google AI Studio key for the Gemini 2.5 Flash model. |
+| `OPENAI_API_KEY` | (Optional) OpenAI key used with the GPT-5 Nano fallback model. |
 
-Exact times vary within each window for natural variety.
+> ℹ️ If neither `GEMINI_API_KEY` nor `OPENAI_API_KEY` is supplied the agent logs a warning and skips publishing.
 
-## Setup Required
+## Local Usage
 
-1. LinkedIn API credentials
-2. Claude or OpenAI API key
-3. GitHub secrets configured
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+export LINKEDIN_ACCESS_TOKEN=...  # etc.
+python linkedin_agent.py
+```
 
-See full setup instructions in the repository.
+Environment flags:
 
-## Status
+- `SKIP_DELAY=1` – bypass the randomized wait window.
+- `FORCE_POST=1` – ignore the once-per-day guard (useful for testing).
+- `NEWS_SOURCE=pymnts` – prefer PYMNTS coverage across all topics.
+- `REQUIRE_LINK=1` – force the agent to find a publisher link or fail.
 
-Current post count: Check `agent_state.json` for stats.
+## State & Monitoring
 
----
+- `agent_state.json` tracks topic rotation, hashtag usage, and post counts. It is committed back to the repository by the workflow for continuity.
+- Console output (in Actions logs) shows which topic, tone, structure, and article set powered the post.
 
-*Powered by Claude/GPT + GitHub Actions*
+## Troubleshooting
+
+- Missing LinkedIn secrets or model keys trigger explicit console messages and the run exits without posting.
+- LinkedIn API failures raise an error, ensuring the GitHub Action surfaces as failed for quick review.
+
+Happy posting! 🎯
