@@ -21,8 +21,11 @@ The `linkedin_agent.py` script automates creating and optionally publishing Link
 - `SKIP_DELAY` or `DISABLE_DELAY`: Disable the randomized posting delay.
 
 ## Extending or Testing
-- Add or edit topic queries and hashtag pools in the `LinkedInAIAgent` initializer.  
-- Adjust stylistic helpers (e.g., `enforce_style_rules`, `debuzz`, `curated_hashtags`) to tweak tone or formatting.  
-- Modify `local_compose` templates if you need deterministic fallback copy.  
+- Add or edit topic queries and hashtag pools in the `LinkedInAIAgent` initializer.
+- Adjust stylistic helpers (e.g., `enforce_style_rules`, `debuzz`, `curated_hashtags`) to tweak tone or formatting.
+- Modify `local_compose` templates if you need deterministic fallback copy.
 - Use the included pytest suites for integration/property checks around text sanitization and output constraints.
+
+## Offline Fallback
+When both Gemini and OpenAI refuse or error, the agent assembles a deterministic draft locally via `local_compose`. The routine stitches together stored hooks, angles, examples, and tips for each topic so you still get a polished 110–140 word post without any model calls. This path also handles quality-gate failures by regenerating copy offline, ensuring you never rely on external APIs to finish a run.
 
