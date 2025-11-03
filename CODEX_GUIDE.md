@@ -20,6 +20,11 @@ The `linkedin_agent.py` script automates creating and optionally publishing Link
 - `REQUIRE_LINK`: Set `1` to force inclusion of a deep publisher link (will retry news fetching once).  
 - `SKIP_DELAY` or `DISABLE_DELAY`: Disable the randomized posting delay.
 
+## Run Cadence & Workflow Hooks
+- **GitHub Actions** – `.github/workflows/linkedin-agent.yml` schedules runs three times a week: Monday 11:00 UTC, Wednesday 16:00 UTC, and Friday 11:00 UTC. Each cron entry triggers the same job that installs Python 3.10, pulls secrets, and executes `linkedin_agent.py` with `FORCE_POST=1` and `SKIP_DELAY=1` so the script always attempts a post on those days.
+- **Manual dispatch** – The workflow also exposes `workflow_dispatch` if you need an ad-hoc run; trigger it from the Actions tab to run the same job on demand.
+- **State commits** – After the agent runs, the workflow commits any change to `agent_state.json`, allowing the cadence guard to persist between CI invocations.
+
 ## Extending or Testing
 - Add or edit topic queries and hashtag pools in the `LinkedInAIAgent` initializer.
 - Adjust stylistic helpers (e.g., `enforce_style_rules`, `debuzz`, `curated_hashtags`) to tweak tone or formatting.
