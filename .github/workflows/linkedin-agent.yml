@@ -41,11 +41,11 @@
          # # Extra protection so the python step can't hang forever
           #timeout 10m python -u linkedin_agent.py
 
-      - name: Commit state file
-        if: always()
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add agent_state.json || true
-          git commit -m "Update agent state" || true
-          git push || true
+     # - name: Commit state file
+      #  if: always()
+       # run: |
+        #  git config --local user.email "action@github.com"
+         # git config --local user.name "GitHub Action"
+          #git add agent_state.json || true
+         # git commit -m "Update agent state" || true
+         # git push || true
