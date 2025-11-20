@@ -1,80 +1,80 @@
-name: post-to-linkedin
+#name: post-to-linkedin
 
-on:
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Don't post; just print the post (true/false)"
-        type: boolean
-        default: false
-  schedule:
-    # Mon–Fri at 14:05 UTC
-    - cron: "5 14 * * 1-5"
+#on:
+ # workflow_dispatch:
+  #  inputs:
+   #   dry_run:
+    #    description: "Don't post; just print the post (true/false)"
+     #   type: boolean
+      #  default: false
+ # schedule:
+  #  # Mon–Fri at 14:05 UTC
+   # - cron: "5 14 * * 1-5"
 
-concurrency:
-  group: linkedin-agent
-  cancel-in-progress: false
+#concurrency:
+ # group: linkedin-agent
+  #cancel-in-progress: false
 
-jobs:
-  post:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+#jobs:
+ # post:
+  #  runs-on: ubuntu-latest
+   # timeout-minutes: 10
 
-    env:
-      # Real secrets (store in repo/environment secrets)
-      LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
-      LINKEDIN_PERSON_URN: ${{ secrets.LINKEDIN_PERSON_URN }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      # Operational flags
-      SKIP_DELAY: "0"                           # set "1" to bypass random wait
-      FORCE_POST: "1"                           # post even if already posted today
-      DRY_RUN: ${{ github.event.inputs.dry_run }}
+    #env:
+     # # Real secrets (store in repo/environment secrets)
+      #LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
+     # LINKEDIN_PERSON_URN: ${{ secrets.LINKEDIN_PERSON_URN }}
+   #   GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    #  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+     # # Operational flags
+      #SKIP_DELAY: "0"                           # set "1" to bypass random wait
+#      FORCE_POST: "1"                           # post even if already posted today
+ #     DRY_RUN: ${{ github.event.inputs.dry_run }}
 
-    steps:
-      - uses: actions/checkout@v4
+#    steps:
+ #     - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
+  #    - name: Set up Python
+   #     uses: actions/setup-python@v5
+    #    with:
+     #     python-version: "3.11"
+      #    cache: "pip"
 
-      - name: Install runtime deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+#      - name: Install runtime deps
+ #       run: |
+  #        python -m pip install --upgrade pip
+   #       pip install requests
 
-      - name: Run the agent
-        run: |
-          python - <<'PY'
-          import os
-          from linkedin_agent_refined import LinkedInAIAgent, AgentConfig
-          dry = os.getenv("DRY_RUN","false").lower() == "true"
+    #  - name: Run the agent
+     #   run: |
+      #    python - <<'PY'
+       #   import os
+        #  from linkedin_agent_refined import LinkedInAIAgent, AgentConfig
+         # dry = os.getenv("DRY_RUN","false").lower() == "true"
 
-          cfg = AgentConfig(
-              linkedin_token=os.getenv("LINKEDIN_ACCESS_TOKEN",""),
-              person_urn=os.getenv("LINKEDIN_PERSON_URN",""),
-              gemini_key=os.getenv("GEMINI_API_KEY",""),
-              openai_key=os.getenv("OPENAI_API_KEY",""),
-              force_post=os.getenv("FORCE_POST","0") == "1",
-              skip_delay=os.getenv("SKIP_DELAY","0") == "1",
-              state_path="agent_state.json",
-          )
+   #       cfg = AgentConfig(
+    #          linkedin_token=os.getenv("LINKEDIN_ACCESS_TOKEN",""),
+     #         person_urn=os.getenv("LINKEDIN_PERSON_URN",""),
+      #        gemini_key=os.getenv("GEMINI_API_KEY",""),
+       #       openai_key=os.getenv("OPENAI_API_KEY",""),
+        #      force_post=os.getenv("FORCE_POST","0") == "1",
+         #     skip_delay=os.getenv("SKIP_DELAY","0") == "1",
+          #    state_path="agent_state.json",
+          #)
 
-          agent = LinkedInAIAgent(config=cfg)
+#          agent = LinkedInAIAgent(config=cfg)
 
-          if dry:
-              # generate once, print, and exit (no real post)
-              state = agent.load_state()
-              topic_key, state = agent.get_next_topic(state)
-              items = agent.fetch_news(topic_key, "enterprise AI")
-              txt = agent.sanitize_and_finalize(
-                  agent.local_compose(topic_key),
-                  topic_key, True, items, state
-              )
-              print("\n--- DRY RUN POST BELOW ---\n")
-              print(txt)
-          else:
-              agent.run_weekly_post()
-          PY
+ #         if dry:
+  #            # generate once, print, and exit (no real post)
+   #           state = agent.load_state()
+    #          topic_key, state = agent.get_next_topic(state)
+     #         items = agent.fetch_news(topic_key, "enterprise AI")
+      #        txt = agent.sanitize_and_finalize(
+       #           agent.local_compose(topic_key),
+        #          topic_key, True, items, state
+         #     )
+          #    print("\n--- DRY RUN POST BELOW ---\n")
+           #   print(txt)
+     #     else:
+    #          agent.run_weekly_post()
+     #     PY
